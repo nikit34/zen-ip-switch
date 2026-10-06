@@ -3,117 +3,287 @@ set -euo pipefail
 
 OPENCODE_PID_PAT="opencode-cli serve --service"
 IPIFY="https://api.ipify.org"
-ZEN="https://opencode.ai/zen/v1/chat/completions"
+ZEN_HOST="opencode.ai"
+ZEN_BASE="https://${ZEN_HOST}/zen/v1"
+STATE_DIR="${ZEN_STATE_DIR:-$HOME/.local/share/zen-ip-switch}"
+DB="$STATE_DIR/metrics.db"
+DAEMON_PID="$STATE_DIR/daemon.pid"
+DAEMON_LOG="$STATE_DIR/daemon.log"
+POLL_SECS="${ZEN_POLL_SECS:-120}"
+FLOW_WAIT_SECS="${ZEN_FLOW_WAIT_SECS:-60}"
+IP_WAIT_SECS="${ZEN_IP_WAIT_SECS:-20}"
+MAX_ROTATE_TRIES="${ZEN_MAX_ROTATE_TRIES:-5}"
+
+mkdir -p "$STATE_DIR"
 
 step() { printf "\n\033[1;34m== %s\033[0m\n" "$*"; }
 ok()   { printf "\033[1;32mOK\033[0m  %s\n" "$*"; }
 warn() { printf "\033[1;33m!!\033[0m  %s\n" "$*"; }
 die()  { printf "\033[1;31mXX\033[0m  %s\n" "$*" >&2; exit 1; }
 
-cur_ip() { curl -s --max-time 5 "$IPIFY" || echo unknown; }
+db_init() {
+  sqlite3 "$DB" <<SQL
+CREATE TABLE IF NOT EXISTS rotations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  before_ip TEXT,
+  after_ip TEXT,
+  zen_before INTEGER,
+  zen_after INTEGER,
+  model TEXT,
+  reason TEXT
+);
+CREATE TABLE IF NOT EXISTS probes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  ip TEXT,
+  model TEXT,
+  code INTEGER
+);
+CREATE INDEX IF NOT EXISTS probes_ts ON probes(ts);
+CREATE INDEX IF NOT EXISTS rotations_ts ON rotations(ts);
+SQL
+}
+
+cur_ip() { curl -s --max-time 5 "$IPIFY" || echo ""; }
+
+discover_free_model() {
+  curl -s --max-time 10 "$ZEN_BASE/models" \
+    -H "User-Agent: opencode/2.0.24" \
+    | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("space-bunny-free"); sys.exit(0)
+free = [m["id"] for m in d.get("data", []) if isinstance(m, dict) and m.get("id","").endswith("-free")]
+free = [m for m in free if not m.startswith("jev-")]
+for pref in ("space-bunny-free","mimo-v2.6-flash-free","nemotron-3-ultra-free","longcat-2.5-preview-free"):
+    if pref in free: print(pref); sys.exit(0)
+print(free[0] if free else "space-bunny-free")
+' 2>/dev/null || echo "space-bunny-free"
+}
 
 probe_zen() {
-  curl -s -o /dev/null --max-time 10 -w "%{http_code}" "$ZEN" \
+  local model="$1"
+  curl -s -o /dev/null --max-time 12 -w "%{http_code}" "$ZEN_BASE/chat/completions" \
     -H "Authorization: Bearer public" \
     -H "Content-Type: application/json" \
     -H "x-opencode-session: ses_$(openssl rand -hex 13)" \
     -H "User-Agent: opencode/2.0.24" \
-    -d '{"model":"space-bunny-free","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}"
+}
+
+log_probe() {
+  local ip="$1" model="$2" code="$3"
+  sqlite3 "$DB" "INSERT INTO probes(ts,ip,model,code) VALUES ($(date +%s),'$ip','$model',$code);"
+}
+
+log_rotation() {
+  local b="$1" a="$2" zb="$3" za="$4" m="$5" r="$6"
+  sqlite3 "$DB" "INSERT INTO rotations(ts,before_ip,after_ip,zen_before,zen_after,model,reason) VALUES ($(date +%s),'$b','$a',$zb,$za,'$m','$r');"
+}
+
+opencode_flows() {
+  local n=0
+  if command -v lsof >/dev/null; then
+    n=$(lsof -nP -iTCP:443 2>/dev/null | awk '/ESTABLISHED/ && /opencode/' | wc -l | tr -d ' ')
+  fi
+  echo "${n:-0}"
+}
+
+wait_for_idle() {
+  local waited=0
+  while (( waited < FLOW_WAIT_SECS )); do
+    local n; n=$(opencode_flows)
+    (( n == 0 )) && return 0
+    sleep 2; waited=$((waited+2))
+  done
+  warn "ждал $FLOW_WAIT_SECS сек, активных соединений opencode-cli всё ещё $(opencode_flows). ротирую, стрим может оборваться."
 }
 
 ensure_warp() {
-  if command -v warp-cli >/dev/null; then
-    ok "warp-cli найден"
-    return
-  fi
+  if command -v warp-cli >/dev/null; then return; fi
   if ! command -v brew >/dev/null; then
     die "brew не найден. Поставь Homebrew или WARP вручную: https://1.1.1.1"
   fi
-  step "Ставлю Cloudflare WARP (brew cask)"
+  step "Ставлю Cloudflare WARP"
   brew install --cask cloudflare-warp
 }
 
-warp_up() {
+warp_connect_once() {
   local before="$1"
   warp-cli --accept-tos registration new 2>/dev/null || true
-  warp-cli --accept-tos connect 2>/dev/null || warp-cli connect
-  for i in $(seq 1 20); do
+  warp-cli --accept-tos connect 2>/dev/null || warp-cli connect >/dev/null 2>&1 || true
+  for _ in $(seq 1 "$IP_WAIT_SECS"); do
     sleep 1
-    now=$(cur_ip)
-    if [[ -n "$now" && "$now" != "unknown" && "$now" != "$before" ]]; then
-      ok "WARP маршрутизирует: $before -> $now"
-      return
-    fi
+    local now; now=$(cur_ip)
+    if [[ -n "$now" && "$now" != "$before" ]]; then echo "$now"; return 0; fi
   done
-  warn "IP не сменился за 20 сек. Статус WARP:"
-  warp-cli status 2>&1 | head -3
-  die "Открой приложение 1.1.1.1 вручную и жми Connect, потом запусти снова."
+  echo ""
+  return 1
 }
 
-warp_down() { warp-cli disconnect >/dev/null 2>&1 || true; }
+warp_rotate_once() {
+  local before="$1"
+  warp-cli disconnect >/dev/null 2>&1 || true
+  sleep 2
+  warp_connect_once "$before"
+}
 
 bounce_opencode() {
-  pids=$(pgrep -f "$OPENCODE_PID_PAT" || true)
-  [[ -z "$pids" ]] && { warn "opencode-cli не запущен, перезапуск не нужен"; return; }
-  step "Перезапускаю opencode-cli ($pids), чтобы оборвать уже открытые соединения"
-  kill $pids
+  local pids; pids=$(pgrep -f "$OPENCODE_PID_PAT" || true)
+  [[ -z "$pids" ]] && { warn "opencode-cli не запущен"; return; }
+  kill $pids 2>/dev/null || true
   sleep 2
-  pgrep -f "$OPENCODE_PID_PAT" >/dev/null && ok "сайдкар поднялся заново" \
-    || warn "сайдкар не поднялся сам - открой окно OpenCode"
+  pgrep -f "$OPENCODE_PID_PAT" >/dev/null && ok "сайдкар переподнят Electron'ом" \
+    || warn "сайдкар не поднялся. Открой окно OpenCode."
 }
 
-cmd=${1:-on}
-case "$cmd" in
-  status)
-    step "Текущий публичный IP"
-    echo "  $(cur_ip)"
-    step "WARP"
-    command -v warp-cli >/dev/null && warp-cli status 2>&1 | head -3 || echo "не установлен"
-    step "Проверка Zen (одним запросом)"
-    code=$(probe_zen); echo "  HTTP $code"
-    [[ "$code" == "200" ]] && ok "лимит свободен" || warn "лимит выбран или сетка"
-    ;;
-  on)
-    before=$(cur_ip); step "IP до: $before"
-    ensure_warp
-    warp_up "$before"
-    sleep 1
-    after=$(cur_ip); step "IP после: $after"
-    [[ "$before" == "$after" ]] && die "IP не сменился - WARP не маршрутизирует трафик"
-    code=$(probe_zen); step "Zen HTTP: $code"
-    if [[ "$code" == "200" ]]; then
+do_rotate() {
+  local reason="${1:-manual}"
+  db_init
+  local model; model=$(discover_free_model)
+  local before; before=$(cur_ip)
+  local zb; zb=$(probe_zen "$model"); log_probe "$before" "$model" "$zb"
+  step "flow guard: активных соединений opencode-cli: $(opencode_flows)"
+  wait_for_idle
+  local after="" try=0
+  for try in $(seq 1 "$MAX_ROTATE_TRIES"); do
+    step "ротация $try/$MAX_ROTATE_TRIES: $before -> ..."
+    after=$(warp_rotate_once "$before" || true)
+    [[ -z "$after" ]] && { warn "WARP не сменил IP на попытке $try"; continue; }
+    local za; za=$(probe_zen "$model"); log_probe "$after" "$model" "$za"
+    if [[ "$za" == "200" ]]; then
+      ok "exit $after, Zen HTTP 200 на '$model'"
+      log_rotation "$before" "$after" "$zb" "$za" "$model" "$reason"
       bounce_opencode
-      ok "готово. OpenCode теперь ходит в Zen с $after."
-    else
-      warn "Zen всё ещё отвечает $code. Либо на этом IP уже кто-то выжег лимит, либо дело не в IP."
-      warn "Попробуй: $0 rotate   # отключит и подключит WARP ещё раз, он даст другой exit."
+      return 0
     fi
-    ;;
-  rotate)
-    step "Крутим WARP exit"
-    warp-cli disconnect >/dev/null 2>&1 || true
-    sleep 2
-    warp-cli connect
-    sleep 3
-    echo "  новый IP: $(cur_ip)"
-    code=$(probe_zen); echo "  Zen HTTP: $code"
-    [[ "$code" == "200" ]] && bounce_opencode && ok "готово"
-    ;;
-  off)
-    step "Выключаю WARP"
-    warp_down
-    sleep 1
-    step "IP: $(cur_ip)"
+    warn "exit $after выдал HTTP $za, пробую другой"
+    before="$after"
+  done
+  log_rotation "$before" "${after:-}" "$zb" "0" "$model" "$reason:failed"
+  die "за $MAX_ROTATE_TRIES попыток не нашёл свободный exit. Квота у Cloudflare WARP общая, подожди или сменю провайдера."
+}
+
+do_on() {
+  db_init
+  local before; before=$(cur_ip); step "IP до: $before"
+  ensure_warp
+  local after; after=$(warp_connect_once "$before" || true)
+  [[ -z "$after" ]] && { warn "IP не сменился за $IP_WAIT_SECS сек"; warp-cli status 2>&1 | head -3; die "Открой приложение 1.1.1.1 и жми Connect вручную."; }
+  ok "WARP: $before -> $after"
+  local model; model=$(discover_free_model)
+  local code; code=$(probe_zen "$model"); log_probe "$after" "$model" "$code"
+  step "Zen HTTP: $code (модель $model)"
+  if [[ "$code" == "200" ]]; then
+    log_rotation "$before" "$after" "" "$code" "$model" "on"
     bounce_opencode
-    ;;
+    ok "готово"
+  else
+    warn "Zen на $after отвечает $code. Запусти: $0 rotate"
+  fi
+}
+
+do_off() {
+  step "Выключаю WARP"
+  warp-cli disconnect >/dev/null 2>&1 || true
+  sleep 1
+  step "IP: $(cur_ip)"
+  bounce_opencode
+}
+
+do_status() {
+  db_init
+  local ip; ip=$(cur_ip)
+  step "Публичный IP: $ip"
+  step "WARP"
+  command -v warp-cli >/dev/null && warp-cli status 2>&1 | head -3 || echo "не установлен"
+  step "Daemon"
+  if [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
+    echo "running pid=$(cat "$DAEMON_PID")  log: $DAEMON_LOG"
+  else
+    echo "stopped"
+  fi
+  step "Активных соединений opencode-cli к :443: $(opencode_flows)"
+  step "Пробный Zen"
+  local model; model=$(discover_free_model)
+  local code; code=$(probe_zen "$model"); log_probe "$ip" "$model" "$code"
+  echo "  модель $model -> HTTP $code"
+}
+
+do_stats() {
+  db_init
+  step "Последние 10 ротаций"
+  sqlite3 -column -header "$DB" "SELECT datetime(ts,'unixepoch','localtime') AS ts, before_ip, after_ip, zen_before AS zb, zen_after AS za, model, reason FROM rotations ORDER BY ts DESC LIMIT 10;"
+  step "Распределение probe-кодов за 24 часа"
+  sqlite3 -column -header "$DB" "SELECT code, count(*) AS n FROM probes WHERE ts > strftime('%s','now','-1 day') GROUP BY code ORDER BY n DESC;"
+  step "Последние 10 probe"
+  sqlite3 -column -header "$DB" "SELECT datetime(ts,'unixepoch','localtime') AS ts, ip, model, code FROM probes ORDER BY ts DESC LIMIT 10;"
+}
+
+do_daemon() {
+  db_init
+  if [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
+    die "demon уже запущен, pid=$(cat "$DAEMON_PID")"
+  fi
+  ensure_warp
+  step "Запускаю демон (polling каждые $POLL_SECS сек, лог $DAEMON_LOG)"
+  nohup bash -c "
+    while true; do
+      ts=\$(date -u +%FT%TZ)
+      model=\$($0 _discover 2>/dev/null)
+      ip=\$(curl -s --max-time 5 '$IPIFY')
+      code=\$(curl -s -o /dev/null --max-time 12 -w '%{http_code}' '$ZEN_BASE/chat/completions' -H 'Authorization: Bearer public' -H 'Content-Type: application/json' -H \"x-opencode-session: ses_\$(openssl rand -hex 13)\" -H 'User-Agent: opencode/2.0.24' -d \"{\\\"model\\\":\\\"\$model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hi\\\"}],\\\"max_tokens\\\":1}\")
+      sqlite3 '$DB' \"INSERT INTO probes(ts,ip,model,code) VALUES (\$(date +%s),'\$ip','\$model',\$code);\"
+      echo \"\$ts ip=\$ip model=\$model code=\$code\"
+      if [[ \"\$code\" == 429 ]]; then
+        echo \"\$ts -> 429, запускаю rotate\"
+        '$0' rotate auto 2>&1 || echo \"\$ts rotate failed\"
+      fi
+      sleep $POLL_SECS
+    done
+  " >>"$DAEMON_LOG" 2>&1 &
+  echo $! >"$DAEMON_PID"
+  disown || true
+  sleep 1
+  ok "demon pid=$(cat "$DAEMON_PID")"
+}
+
+do_daemon_stop() {
+  [[ -f "$DAEMON_PID" ]] || { warn "pid-файл не найден"; return; }
+  local pid; pid=$(cat "$DAEMON_PID")
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+    ok "demon pid=$pid остановлен"
+  else
+    warn "pid=$pid не живой"
+  fi
+  rm -f "$DAEMON_PID"
+}
+
+case "${1:-}" in
+  status)         do_status ;;
+  on)             do_on ;;
+  off)            do_off ;;
+  rotate)         shift; do_rotate "${1:-manual}" ;;
+  stats)          do_stats ;;
+  daemon|start)   do_daemon ;;
+  stop)           do_daemon_stop ;;
+  _discover)      discover_free_model ;;
   *)
     cat <<EOF
-Usage: $0 {status|on|rotate|off}
-  status - показать IP, статус WARP и ответ Zen
-  on     - включить WARP, проверить Zen, перезапустить opencode-cli
-  rotate - переподключить WARP (новый exit)
-  off    - выключить WARP, вернуть прямое соединение
+Usage: $0 <cmd>
+  status           публичный IP, статус WARP, активные соединения, пробный Zen
+  on               включить WARP, проверить Zen, перезапустить opencode-cli
+  off              выключить WARP, вернуть прямое соединение
+  rotate [reason]  переподключить WARP с проверкой нового IP и свободного exit
+  daemon           фоновый polling: при 429 автоматически ротирует
+  stop             остановить фоновый polling
+  stats            последние ротации и probe из SQLite ($DB)
 EOF
-    exit 1
-    ;;
+    exit 1 ;;
 esac
