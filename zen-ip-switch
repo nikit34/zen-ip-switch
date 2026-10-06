@@ -169,17 +169,14 @@ app_quit_wait() {
 }
 
 app_launch_with_proxy() {
-  nohup env \
-    ALL_PROXY="$WARP_PROXY_URL" \
-    HTTPS_PROXY="$WARP_PROXY_URL" \
-    HTTP_PROXY="$WARP_PROXY_URL" \
-    "$OPENCODE_APP_BIN" >/dev/null 2>&1 &
-  disown || true
+  open -a OpenCode \
+    --env "ALL_PROXY=$WARP_PROXY_URL" \
+    --env "HTTPS_PROXY=$WARP_PROXY_URL" \
+    --env "HTTP_PROXY=$WARP_PROXY_URL"
 }
 
 app_launch_direct() {
-  nohup "$OPENCODE_APP_BIN" >/dev/null 2>&1 &
-  disown || true
+  open -a OpenCode
 }
 
 sidecar_has_proxy_env() {
