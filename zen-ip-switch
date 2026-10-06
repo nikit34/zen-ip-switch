@@ -159,28 +159,22 @@ warp_rotate_once() {
   warp_connect_once "$before"
 }
 
-warn_stale_sockets() {
+restart_if_stale() {
   local n; n=$(opencode_flows_all)
   (( n == 0 )) && return
-  warn "у сайдкара $n живых HTTP/2 сокетов к opencode.ai. При смене маршрута на WARP они станут полу-мёртвыми - Bun fetch будет ретраить через тот же agent pool (ECONNRESET x N)."
-  warn "Решение: $0 restart-app (перезапустит OpenCode.app, новый сайдкар подхватит WARP с чистого листа)."
-}
-
-do_restart_app() {
-  if ! pgrep -lf "/Applications/OpenCode.app/Contents/MacOS/OpenCode" >/dev/null; then
-    warn "OpenCode.app не запущен"
-    return
-  fi
-  step "закрываю OpenCode.app"
+  pgrep -f "/Applications/OpenCode.app/Contents/MacOS/OpenCode" >/dev/null \
+    || { warn "сокеты есть, но OpenCode.app не запущен - странно, пропускаю"; return; }
+  step "у сайдкара $n живых HTTP/2 сокетов на старом маршруте, перезапускаю OpenCode.app"
   osascript -e 'tell application "OpenCode" to quit' 2>/dev/null || true
   local waited=0
   while (( waited < 15 )); do
     sleep 1; waited=$((waited+1))
     pgrep -f "/Applications/OpenCode.app/Contents/MacOS/OpenCode" >/dev/null || break
   done
-  pgrep -f "/Applications/OpenCode.app/Contents/MacOS/OpenCode" >/dev/null \
-    && { warn "не закрылся за 15 сек, попробуй вручную"; return; }
-  step "запускаю OpenCode.app"
+  if pgrep -f "/Applications/OpenCode.app/Contents/MacOS/OpenCode" >/dev/null; then
+    warn "не закрылся за 15 сек, закрой вручную"
+    return
+  fi
   open -a OpenCode
   ok "OpenCode.app перезапущен, сайдкар стартует через WARP"
 }
@@ -202,7 +196,7 @@ do_rotate() {
     if [[ "$za" == "200" ]]; then
       ok "exit $after, Zen HTTP 200 на '$model'"
       log_rotation "$before" "$after" "$zb" "$za" "$model" "$reason"
-      warn_stale_sockets
+      restart_if_stale
       return 0
     fi
     warn "exit $after выдал HTTP $za, пробую другой"
@@ -224,7 +218,7 @@ do_on() {
   step "Zen HTTP: $code (модель $model)"
   if [[ "$code" == "200" ]]; then
     log_rotation "$before" "$after" "" "$code" "$model" "on"
-    warn_stale_sockets
+    restart_if_stale
     ok "готово"
   else
     warn "Zen на $after отвечает $code. Запусти: $0 rotate"
@@ -236,7 +230,7 @@ do_off() {
   warp-cli disconnect >/dev/null 2>&1 || true
   sleep 1
   step "IP: $(cur_ip)"
-  warn_stale_sockets
+  restart_if_stale
 }
 
 do_status() {
@@ -336,7 +330,6 @@ case "${1:-}" in
   stats)          do_stats ;;
   daemon|start)   do_daemon ;;
   stop)           do_daemon_stop ;;
-  restart-app)    do_restart_app ;;
   _discover)      discover_free_model ;;
   _loop)          do_daemon_loop ;;
   *)
@@ -348,7 +341,6 @@ Usage: $0 <cmd>
   rotate [reason]  переподключить WARP с проверкой нового IP и свободного exit
   daemon           фоновый polling: при 429 автоматически ротирует
   stop             остановить фоновый polling
-  restart-app      закрыть и открыть OpenCode.app (чистые сокеты через WARP)
   stats            последние ротации и probe из SQLite ($DB)
 EOF
     exit 1 ;;
