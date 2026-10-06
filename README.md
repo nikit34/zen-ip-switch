@@ -62,11 +62,13 @@ WARP на macOS подолгу висит в `Connecting: Performing connectivit
 
 ### Flow guard
 
-Перед ротацией смотрим `lsof -iTCP:443`: если есть открытые соединения процесса `opencode-cli`, ждём до `ZEN_FLOW_WAIT_SECS` (60 сек) пока они закроются. Это защищает активный SSE-стрим от обрыва. По таймауту ротируем всё равно, с предупреждением.
+Перед ротацией снимаем через `nettop` два значения `bytes_in` сайдкара `opencode-cli` с интервалом `ZEN_FLOW_SAMPLE_SECS` (по умолчанию 2 сек). Если дельта меньше `ZEN_FLOW_IDLE_BYTES` (512 байт), считаем, что идёт только keep-alive-пинг - ротируем. Если данные льются (SSE активный) - ждём, повторяем, до `ZEN_FLOW_WAIT_SECS` (30 сек) суммарно. По таймауту ротируем всё равно с предупреждением (клиент получит ECONNRESET на активном стриме, OpenCode обычно сам ретраит).
+
+Прошлая версия сравнивала наборы fd у `lsof` - это ловит открытие и закрытие соединения, но не льющийся через стабильный fd SSE. Через `nettop` виден реальный байтовый поток процесса, без root.
 
 ### Daemon
 
-`daemon` запускает фоновый loop через `nohup`, каждые `ZEN_POLL_SECS` (120 сек) делает probe. При `429` автоматически вызывает `rotate auto`. Pid в `~/.local/share/zen-ip-switch/daemon.pid`, лог в `daemon.log`. `stop` его убивает.
+`daemon` запускает `nohup $0 _loop` в фоне, каждые `ZEN_POLL_SECS` (120 сек) делает probe. При `429` автоматически вызывает `rotate auto`. При `5xx` ничего не делает - upstream болеет, ротация не поможет. Pid в `~/.local/share/zen-ip-switch/daemon.pid`, лог в `daemon.log`. `stop` рекурсивно убивает демон вместе с его дочерним `rotate` (раньше дочерние висели).
 
 ### SQLite метрики
 
@@ -84,7 +86,9 @@ probes(ts, ip, model, code)
 ```
 ZEN_STATE_DIR          каталог для sqlite и pid-файла (по умолчанию ~/.local/share/zen-ip-switch)
 ZEN_POLL_SECS          интервал polling для daemon (120)
-ZEN_FLOW_WAIT_SECS     сколько ждать свободных соединений перед ротацией (60)
+ZEN_FLOW_WAIT_SECS     максимум ожидания тишины в трафике сайдкара (30)
+ZEN_FLOW_SAMPLE_SECS   интервал между двумя снимками bytes_in от nettop (2)
+ZEN_FLOW_IDLE_BYTES    порог: меньше этого за ZEN_FLOW_SAMPLE_SECS считается idle (512)
 ZEN_IP_WAIT_SECS       сколько ждать смены IP после connect (20)
 ZEN_MAX_ROTATE_TRIES   сколько попыток найти свободный exit (5)
 ```
