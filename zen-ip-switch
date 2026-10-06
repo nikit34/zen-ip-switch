@@ -10,7 +10,8 @@ DB="$STATE_DIR/metrics.db"
 DAEMON_PID="$STATE_DIR/daemon.pid"
 DAEMON_LOG="$STATE_DIR/daemon.log"
 POLL_SECS="${ZEN_POLL_SECS:-120}"
-FLOW_WAIT_SECS="${ZEN_FLOW_WAIT_SECS:-60}"
+FLOW_WAIT_SECS="${ZEN_FLOW_WAIT_SECS:-10}"
+FLOW_FRESH_SECS="${ZEN_FLOW_FRESH_SECS:-3}"
 IP_WAIT_SECS="${ZEN_IP_WAIT_SECS:-20}"
 MAX_ROTATE_TRIES="${ZEN_MAX_ROTATE_TRIES:-5}"
 
@@ -84,22 +85,38 @@ log_rotation() {
   sqlite3 "$DB" "INSERT INTO rotations(ts,before_ip,after_ip,zen_before,zen_after,model,reason) VALUES ($(date +%s),'$b','$a',$zb,$za,'$m','$r');"
 }
 
-opencode_flows() {
-  local n=0
-  if command -v lsof >/dev/null; then
-    n=$(lsof -nP -iTCP:443 2>/dev/null | awk '/ESTABLISHED/ && /opencode/' | wc -l | tr -d ' ')
-  fi
-  echo "${n:-0}"
+opencode_flows_all() {
+  command -v lsof >/dev/null || { echo 0; return; }
+  lsof -nP -iTCP:443 2>/dev/null | awk '/ESTABLISHED/ && /opencode/' | wc -l | tr -d ' '
+}
+
+opencode_flows_snapshot() {
+  command -v lsof >/dev/null || { echo ""; return; }
+  lsof -nP -iTCP:443 -sTCP:ESTABLISHED 2>/dev/null \
+    | awk '/opencode/ {print $2"-"$4}' | sort
+}
+
+# «активными» считаем те, у которых fd появился или пропал между двумя
+# снимками: keep-alive пул opencode-cli стабилен между сборами, стрим - нет
+opencode_flows_active() {
+  local a b
+  a=$(opencode_flows_snapshot)
+  sleep "${FLOW_FRESH_SECS:-2}"
+  b=$(opencode_flows_snapshot)
+  diff <(echo "$a") <(echo "$b") | grep -c '^[<>]' || true
 }
 
 wait_for_idle() {
   local waited=0
   while (( waited < FLOW_WAIT_SECS )); do
-    local n; n=$(opencode_flows)
-    (( n == 0 )) && return 0
+    local n; n=$(opencode_flows_active)
+    if (( n == 0 )); then
+      ok "flow guard: keep-alive пул стабилен, активных стримов нет"
+      return 0
+    fi
     sleep 2; waited=$((waited+2))
   done
-  warn "ждал $FLOW_WAIT_SECS сек, активных соединений opencode-cli всё ещё $(opencode_flows). ротирую, стрим может оборваться."
+  warn "ждал $FLOW_WAIT_SECS сек, активность в соединениях сохраняется. Ротирую, стрим может оборваться."
 }
 
 ensure_warp() {
@@ -146,7 +163,7 @@ do_rotate() {
   local model; model=$(discover_free_model)
   local before; before=$(cur_ip)
   local zb; zb=$(probe_zen "$model"); log_probe "$before" "$model" "$zb"
-  step "flow guard: активных соединений opencode-cli: $(opencode_flows)"
+  step "flow guard: соединений opencode-cli всего: $(opencode_flows_all)"
   wait_for_idle
   local after="" try=0
   for try in $(seq 1 "$MAX_ROTATE_TRIES"); do
@@ -206,7 +223,7 @@ do_status() {
   else
     echo "stopped"
   fi
-  step "Активных соединений opencode-cli к :443: $(opencode_flows)"
+  step "Соединений opencode-cli к :443: $(opencode_flows_all) (keep-alive пул)"
   step "Пробный Zen"
   local model; model=$(discover_free_model)
   local code; code=$(probe_zen "$model"); log_probe "$ip" "$model" "$code"
@@ -251,14 +268,23 @@ do_daemon() {
   ok "demon pid=$(cat "$DAEMON_PID")"
 }
 
+kill_tree() {
+  local pid="$1"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+  sleep 0.2
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+}
+
 do_daemon_stop() {
   [[ -f "$DAEMON_PID" ]] || { warn "pid-файл не найден"; return; }
   local pid; pid=$(cat "$DAEMON_PID")
   if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    sleep 1
-    kill -9 "$pid" 2>/dev/null || true
-    ok "demon pid=$pid остановлен"
+    kill_tree "$pid"
+    ok "demon pid=$pid и его дети остановлены"
   else
     warn "pid=$pid не живой"
   fi
