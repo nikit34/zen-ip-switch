@@ -143,16 +143,29 @@ warp_rotate_exit() {
 
 app_running()  { pgrep -f "$OPENCODE_APP_BIN" >/dev/null; }
 
+kill_sidecar() {
+  local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
+  [[ -z "$pid" ]] && return
+  kill "$pid" 2>/dev/null || true
+  sleep 1
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+}
+
 app_quit_wait() {
-  if ! app_running; then return 0; fi
-  osascript -e 'tell application "OpenCode" to quit' 2>/dev/null || true
-  local waited=0
-  while (( waited < APP_QUIT_WAIT )); do
-    sleep 1; waited=$((waited+1))
-    app_running || return 0
-  done
-  warn "OpenCode.app не закрылся за ${APP_QUIT_WAIT} сек"
-  return 1
+  if app_running; then
+    osascript -e 'tell application "OpenCode" to quit' 2>/dev/null || true
+    local waited=0
+    while (( waited < APP_QUIT_WAIT )); do
+      sleep 1; waited=$((waited+1))
+      app_running || break
+    done
+    if app_running; then
+      warn "OpenCode.app не закрылся за ${APP_QUIT_WAIT} сек"
+      return 1
+    fi
+  fi
+  kill_sidecar
+  return 0
 }
 
 app_launch_with_proxy() {
