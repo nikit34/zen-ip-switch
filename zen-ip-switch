@@ -14,7 +14,11 @@ POLL_SECS="${ZEN_POLL_SECS:-120}"
 IP_WAIT_SECS="${ZEN_IP_WAIT_SECS:-20}"
 MAX_ROTATE_TRIES="${ZEN_MAX_ROTATE_TRIES:-5}"
 WARP_PROXY_PORT="${ZEN_WARP_PROXY_PORT:-40000}"
-WARP_PROXY_URL="socks5h://127.0.0.1:${WARP_PROXY_PORT}"
+PRIVOXY_PORT="${ZEN_PRIVOXY_PORT:-8787}"
+PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
+PRIVOXY_PID="$STATE_DIR/privoxy.pid"
+PRIVOXY_LOG="$STATE_DIR/privoxy.log"
+HTTP_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
 APP_QUIT_WAIT="${ZEN_APP_QUIT_WAIT:-15}"
 
 mkdir -p "$STATE_DIR"
@@ -65,8 +69,13 @@ warp_connected() {
   warp-cli status 2>/dev/null | head -1 | grep -q "Connected"
 }
 
+privoxy_running() {
+  [[ -f "$PRIVOXY_PID" ]] && kill -0 "$(cat "$PRIVOXY_PID")" 2>/dev/null
+}
+
 cur_ip_direct() { curl -s --max-time 5 "$IPIFY" || echo ""; }
 cur_ip_warp()   { curl -s --socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}" --max-time 8 "$IPIFY" || echo ""; }
+cur_ip_http()   { curl -s -x "$HTTP_PROXY_URL" --max-time 8 "$IPIFY" || echo ""; }
 
 discover_free_model() {
   curl -s --max-time 10 "$ZEN_BASE/models" \
@@ -114,6 +123,50 @@ ensure_proxy_mode() {
     warp-cli mode proxy >/dev/null 2>&1 || die "не смог поставить proxy mode"
     warp-cli proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
   fi
+}
+
+ensure_privoxy() {
+  if command -v privoxy >/dev/null; then return; fi
+  if ! command -v brew >/dev/null; then
+    die "privoxy нет и brew нет. Поставь: brew install privoxy"
+  fi
+  step "ставлю privoxy (HTTP -> SOCKS мост)"
+  brew install privoxy
+}
+
+write_privoxy_conf() {
+  cat > "$PRIVOXY_CONF" <<EOF
+listen-address 127.0.0.1:${PRIVOXY_PORT}
+forward-socks5t / 127.0.0.1:${WARP_PROXY_PORT} .
+confdir $STATE_DIR
+logdir $STATE_DIR
+logfile privoxy.log
+toggle 1
+accept-intercepted-requests 0
+allow-cgi-request-crunching 0
+split-large-forms 0
+keep-alive-timeout 60
+tolerate-pipelining 1
+EOF
+}
+
+start_privoxy() {
+  if privoxy_running; then return; fi
+  write_privoxy_conf
+  nohup privoxy --no-daemon "$PRIVOXY_CONF" >/dev/null 2>&1 &
+  echo $! > "$PRIVOXY_PID"
+  disown || true
+  sleep 1
+  privoxy_running || die "privoxy не стартовал (лог: $PRIVOXY_LOG)"
+}
+
+stop_privoxy() {
+  [[ -f "$PRIVOXY_PID" ]] || return
+  local pid; pid=$(cat "$PRIVOXY_PID")
+  kill "$pid" 2>/dev/null || true
+  sleep 0.3
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PRIVOXY_PID"
 }
 
 warp_up() {
@@ -170,9 +223,9 @@ app_quit_wait() {
 
 app_launch_with_proxy() {
   open -a OpenCode \
-    --env "ALL_PROXY=$WARP_PROXY_URL" \
-    --env "HTTPS_PROXY=$WARP_PROXY_URL" \
-    --env "HTTP_PROXY=$WARP_PROXY_URL"
+    --env "ALL_PROXY=$HTTP_PROXY_URL" \
+    --env "HTTPS_PROXY=$HTTP_PROXY_URL" \
+    --env "HTTP_PROXY=$HTTP_PROXY_URL"
 }
 
 app_launch_direct() {
@@ -189,13 +242,17 @@ do_on() {
   db_init
   ensure_warp
   ensure_proxy_mode
+  ensure_privoxy
   step "включаю WARP (proxy mode, SOCKS 127.0.0.1:${WARP_PROXY_PORT})"
   local warp_ip; warp_ip=$(warp_up)
   [[ -z "$warp_ip" ]] && die "WARP не поднялся. Открой приложение 1.1.1.1 вручную."
   ok "WARP exit: $warp_ip (прямой IP остался $(cur_ip_direct))"
+  step "поднимаю privoxy ($HTTP_PROXY_URL -> socks5 WARP)"
+  start_privoxy
+  ok "privoxy pid=$(cat "$PRIVOXY_PID")"
   local model; model=$(discover_free_model)
   local code; code=$(probe_zen "$model"); log_probe "$warp_ip" "$model" "$code"
-  step "Zen через SOCKS: HTTP $code (модель $model)"
+  step "Zen через HTTP->SOCKS: HTTP $code (модель $model)"
   if [[ "$code" != "200" ]]; then
     warn "exit $warp_ip тоже выжат, запусти: $0 rotate"
     return
@@ -205,11 +262,11 @@ do_on() {
     if [[ "$(sidecar_has_proxy_env)" == "1" ]]; then
       ok "OpenCode уже стартован с прокси, перезапускать не надо"
     else
-      step "перезапускаю OpenCode.app с ALL_PROXY=$WARP_PROXY_URL"
-      app_quit_wait && app_launch_with_proxy && ok "OpenCode.app запущен через SOCKS"
+      step "перезапускаю OpenCode.app с ALL_PROXY=$HTTP_PROXY_URL"
+      app_quit_wait && app_launch_with_proxy && ok "OpenCode.app запущен через HTTP-прокси"
     fi
   else
-    step "OpenCode.app не запущен, стартую через SOCKS"
+    step "OpenCode.app не запущен, стартую через HTTP-прокси"
     app_launch_with_proxy && ok "OpenCode.app запущен"
   fi
 }
@@ -245,9 +302,11 @@ do_off() {
   step "выключаю WARP"
   warp-cli disconnect >/dev/null 2>&1 || true
   sleep 1
+  step "останавливаю privoxy"
+  stop_privoxy
   step "IP: $(cur_ip_direct)"
   if app_running && [[ "$(sidecar_has_proxy_env)" == "1" ]]; then
-    step "перезапускаю OpenCode.app без прокси (иначе будет ConnectionRefused на SOCKS)"
+    step "перезапускаю OpenCode.app без прокси (иначе будет ConnectionRefused на HTTP-прокси)"
     app_quit_wait && app_launch_direct && ok "OpenCode.app запущен без прокси"
   else
     ok "OpenCode.app не нуждается в перезапуске"
@@ -261,10 +320,17 @@ do_status() {
   if command -v warp-cli >/dev/null; then
     warp-cli status 2>&1 | head -2
     if warp_connected; then
-      step "WARP exit: $(cur_ip_warp) через SOCKS 127.0.0.1:${WARP_PROXY_PORT}"
+      step "WARP exit (через SOCKS :${WARP_PROXY_PORT}): $(cur_ip_warp)"
     fi
   else
     echo "не установлен"
+  fi
+  step "privoxy"
+  if privoxy_running; then
+    echo "running pid=$(cat "$PRIVOXY_PID") на $HTTP_PROXY_URL"
+    step "WARP exit (через HTTP :$PRIVOXY_PORT): $(cur_ip_http)"
+  else
+    echo "stopped"
   fi
   step "OpenCode.app"
   if app_running; then
