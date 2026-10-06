@@ -2,7 +2,7 @@
 set -euo pipefail
 
 OPENCODE_PID_PAT="opencode-cli serve --service"
-OPENCODE_APP_BIN="/Applications/OpenCode.app/Contents/MacOS/OpenCode"
+OPENCODE_APP_BIN="${ZEN_OPENCODE_APP_BIN:-/Applications/OpenCode.app/Contents/MacOS/OpenCode}"
 IPIFY="https://api.ipify.org"
 ZEN_HOST="opencode.ai"
 ZEN_BASE="https://${ZEN_HOST}/zen/v1"
@@ -20,6 +20,7 @@ PRIVOXY_PID="$STATE_DIR/privoxy.pid"
 PRIVOXY_LOG="$STATE_DIR/privoxy.log"
 HTTP_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
 APP_QUIT_WAIT="${ZEN_APP_QUIT_WAIT:-15}"
+AUTO_OFF_IDLE_MINS="${ZEN_AUTO_OFF_IDLE_MINS:-0}"
 
 mkdir -p "$STATE_DIR"
 
@@ -134,6 +135,11 @@ ensure_privoxy() {
   brew install privoxy
 }
 
+ensure_opencode_app() {
+  [[ -x "$OPENCODE_APP_BIN" ]] && return
+  die "OpenCode.app не найден: $OPENCODE_APP_BIN. Поставь из opencode.ai или укажи ZEN_OPENCODE_APP_BIN=/путь/к/бинарнику."
+}
+
 write_privoxy_conf() {
   cat > "$PRIVOXY_CONF" <<EOF
 listen-address 127.0.0.1:${PRIVOXY_PORT}
@@ -147,17 +153,19 @@ allow-cgi-request-crunching 0
 split-large-forms 0
 keep-alive-timeout 60
 tolerate-pipelining 1
+debug 1
+debug 512
 EOF
 }
 
 start_privoxy() {
   if privoxy_running; then return; fi
   write_privoxy_conf
-  nohup privoxy --no-daemon "$PRIVOXY_CONF" >/dev/null 2>&1 &
-  echo $! > "$PRIVOXY_PID"
-  disown || true
+  privoxy "$PRIVOXY_CONF" >/dev/null 2>&1 || die "privoxy не стартовал (лог: $PRIVOXY_LOG)"
   sleep 1
-  privoxy_running || die "privoxy не стартовал (лог: $PRIVOXY_LOG)"
+  local pid; pid=$(pgrep -f "privoxy.*$PRIVOXY_CONF" | head -1 || true)
+  [[ -z "$pid" ]] && die "privoxy запустился, но pid не нашёл (лог: $PRIVOXY_LOG)"
+  echo "$pid" > "$PRIVOXY_PID"
 }
 
 stop_privoxy() {
@@ -232,14 +240,27 @@ app_launch_direct() {
   open -a OpenCode
 }
 
-sidecar_has_proxy_env() {
+sidecar_proxy_env() {
   local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
-  [[ -z "$pid" ]] && { echo 0; return; }
-  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -qE "^(ALL_PROXY|HTTPS_PROXY)=" && echo 1 || echo 0
+  [[ -z "$pid" ]] && { echo ""; return; }
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^(ALL_PROXY|HTTPS_PROXY|HTTP_PROXY)=" | sort -u | tr '\n' ' '
+}
+
+sidecar_has_proxy_env() {
+  [[ -n "$(sidecar_proxy_env)" ]] && echo 1 || echo 0
+}
+
+privoxy_recent_targets() {
+  [[ -f "$PRIVOXY_LOG" ]] || return
+  tail -n 300 "$PRIVOXY_LOG" 2>/dev/null \
+    | grep -E "Request:|Connect:" \
+    | awk '{for(i=1;i<=NF;i++) if ($i=="Request:" || $i=="Connect:") print $(i+1)}' \
+    | awk '!seen[$0]++' | tail -5
 }
 
 do_on() {
   db_init
+  ensure_opencode_app
   ensure_warp
   ensure_proxy_mode
   ensure_privoxy
@@ -306,6 +327,7 @@ do_off() {
   stop_privoxy
   step "IP: $(cur_ip_direct)"
   if app_running && [[ "$(sidecar_has_proxy_env)" == "1" ]]; then
+    [[ -x "$OPENCODE_APP_BIN" ]] || { warn "OpenCode.app не найден, пропускаю перезапуск"; return; }
     step "перезапускаю OpenCode.app без прокси (иначе будет ConnectionRefused на HTTP-прокси)"
     app_quit_wait && app_launch_direct && ok "OpenCode.app запущен без прокси"
   else
@@ -334,9 +356,21 @@ do_status() {
   fi
   step "OpenCode.app"
   if app_running; then
-    echo "запущен, сайдкар с прокси: $(sidecar_has_proxy_env)"
+    local env; env=$(sidecar_proxy_env)
+    if [[ -n "$env" ]]; then
+      echo "запущен, env сайдкара: $env"
+    else
+      echo "запущен, но у сайдкара нет *_PROXY env (сайдкар ходит прямо, в Zen будет 429)"
+    fi
   else
     echo "не запущен"
+  fi
+  step "Трафик через privoxy (последние 5 уникальных CONNECT)"
+  local targets; targets=$(privoxy_recent_targets 2>/dev/null || true)
+  if [[ -n "$targets" ]]; then
+    echo "$targets" | sed 's/^/  /'
+  else
+    echo "  нет данных (privoxy выключен или debug 512 не включен)"
   fi
   step "Daemon"
   if [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
@@ -365,21 +399,46 @@ do_stats() {
 
 do_daemon_loop() {
   db_init
+  trap 'rm -f "$DAEMON_PID"' EXIT INT TERM
+  set +e
+  local idle_cycles=0
   while true; do
+    if warp_connected && ! privoxy_running; then
+      echo "$(date -u +%FT%TZ) privoxy мёртв, поднимаю заново"
+      start_privoxy 2>&1 || echo "privoxy не стартовал"
+    fi
+    if (( AUTO_OFF_IDLE_MINS > 0 )); then
+      if app_running; then
+        idle_cycles=0
+      else
+        idle_cycles=$((idle_cycles+1))
+        if (( idle_cycles * POLL_SECS >= AUTO_OFF_IDLE_MINS * 60 )); then
+          echo "$(date -u +%FT%TZ) OpenCode выключен ${AUTO_OFF_IDLE_MINS}+ мин, запускаю off и выхожу"
+          "$0" off 2>&1 || true
+          break
+        fi
+      fi
+    fi
     local ts model ip code
     ts=$(date -u +%FT%TZ)
-    model=$(discover_free_model)
+    model=$(discover_free_model 2>/dev/null); [[ -z "$model" ]] && model="space-bunny-free"
     if warp_connected; then ip=$(cur_ip_warp); else ip=$(cur_ip_direct); fi
-    code=$(probe_zen "$model")
-    log_probe "$ip" "$model" "$code"
+    code=$(probe_zen "$model"); [[ -z "$code" ]] && code=000
+    log_probe "$ip" "$model" "$code" 2>/dev/null
     echo "$ts ip=$ip model=$model code=$code"
     case "$code" in
       429)
         if warp_connected; then
-          echo "$ts -> 429 на WARP exit, запускаю rotate auto"
+          echo "$ts -> 429, запускаю rotate auto"
           "$0" rotate auto 2>&1 || echo "$ts rotate failed"
         else
           echo "$ts -> 429 на прямом IP, но WARP выключен. Запусти: $0 on"
+        fi
+        ;;
+      403)
+        if warp_connected; then
+          echo "$ts -> 403 (country/region), пробую rotate - вдруг exit в другой стране"
+          "$0" rotate auto403 2>&1 || echo "$ts rotate failed"
         fi
         ;;
       5*)
