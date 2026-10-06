@@ -38,13 +38,24 @@ ln -s ~/zen-ip-switch/zen-ip-switch ~/bin/zen-ip-switch
 
 ```
 zen-ip-switch status           публичный IP, статус WARP, активные соединения, пробный Zen
-zen-ip-switch on               включить WARP, проверить Zen, перезапустить opencode-cli
+zen-ip-switch on               включить WARP, проверить Zen
 zen-ip-switch rotate [reason]  переподключить WARP с проверкой нового IP и свободного exit
 zen-ip-switch off              выключить WARP, вернуть прямое соединение
 zen-ip-switch daemon           фоновый polling: при 429 автоматически ротирует
 zen-ip-switch stop             остановить фоновый polling
+zen-ip-switch restart-app      закрыть и открыть OpenCode.app (чистые сокеты через WARP)
 zen-ip-switch stats            последние ротации и probe из SQLite
 ```
+
+## Ловушка живой коммутации WARP при открытом OpenCode
+
+Сайдкар `opencode-cli serve --service` держит один HTTP/2-сокет к `opencode.ai` на `en0`. Когда ты включаешь WARP при открытом OpenCode, этот сокет остаётся на старом интерфейсе, пакеты по нему перестают доходить, а Bun fetch в сайдкаре не выбрасывает мёртвый коннект из agent pool - на retry он снова идёт в тот же сокет, и ты видишь "Attempt 7 - retrying".
+
+Простой `kill` сайдкара не помогает: Electron поднимает его на случайном порту и теряет связь по IPC. Пришлось бы перезапускать всё приложение.
+
+Поэтому `on` и `rotate` после коммутации только предупреждают, если видят живые внешние сокеты у сайдкара. Чтобы перебить - `restart-app`: osascript корректно закрывает окно (с сохранением сессии), затем `open -a OpenCode` поднимает приложение заново. Новый сайдкар стартует через WARP с чистым пулом.
+
+Либо проще: включай WARP до запуска OpenCode. Тогда сокеты сразу создадутся через WARP, и ECONNRESET-ретраев не будет вовсе.
 
 ## Механизмы
 
