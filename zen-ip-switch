@@ -336,9 +336,9 @@ case "${1:-}" in
     cat <<EOF
 Usage: $0 <cmd>
   status           публичный IP, статус WARP, активные соединения, пробный Zen
-  on               включить WARP, проверить Zen, перезапустить opencode-cli
+  on               включить WARP, проверить Zen, при живых сокетах перезапустить OpenCode.app
   off              выключить WARP, вернуть прямое соединение
-  rotate [reason]  переподключить WARP с проверкой нового IP и свободного exit
+  rotate [reason]  переподключить WARP, проверить exit, при живых сокетах перезапустить OpenCode.app
   daemon           фоновый polling: при 429 автоматически ротирует
   stop             остановить фоновый polling
   stats            последние ротации и probe из SQLite ($DB)
