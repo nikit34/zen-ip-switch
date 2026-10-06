@@ -76,14 +76,17 @@ probe_zen() {
     -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}"
 }
 
+sql_int() { [[ -n "$1" && "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo "NULL"; }
+sql_str() { local s="${1//\'/\'\'}"; echo "'$s'"; }
+
 log_probe() {
   local ip="$1" model="$2" code="$3"
-  sqlite3 "$DB" "INSERT INTO probes(ts,ip,model,code) VALUES ($(date +%s),'$ip','$model',$code);"
+  sqlite3 "$DB" "INSERT INTO probes(ts,ip,model,code) VALUES ($(date +%s),$(sql_str "$ip"),$(sql_str "$model"),$(sql_int "$code"));"
 }
 
 log_rotation() {
   local b="$1" a="$2" zb="$3" za="$4" m="$5" r="$6"
-  sqlite3 "$DB" "INSERT INTO rotations(ts,before_ip,after_ip,zen_before,zen_after,model,reason) VALUES ($(date +%s),'$b','$a',$zb,$za,'$m','$r');"
+  sqlite3 "$DB" "INSERT INTO rotations(ts,before_ip,after_ip,zen_before,zen_after,model,reason) VALUES ($(date +%s),$(sql_str "$b"),$(sql_str "$a"),$(sql_int "$zb"),$(sql_int "$za"),$(sql_str "$m"),$(sql_str "$r"));"
 }
 
 opencode_flows_all() {
@@ -155,13 +158,10 @@ warp_rotate_once() {
   warp_connect_once "$before"
 }
 
-bounce_opencode() {
+notify_client() {
   local pids; pids=$(pgrep -f "$OPENCODE_PID_PAT" || true)
-  [[ -z "$pids" ]] && { warn "opencode-cli не запущен"; return; }
-  kill $pids 2>/dev/null || true
-  sleep 2
-  pgrep -f "$OPENCODE_PID_PAT" >/dev/null && ok "сайдкар переподнят Electron'ом" \
-    || warn "сайдкар не поднялся. Открой окно OpenCode."
+  [[ -z "$pids" ]] && return
+  ok "сайдкар $pids работает. На первом запросе получит ECONNRESET на старом keep-alive и переподключится через WARP."
 }
 
 do_rotate() {
@@ -181,7 +181,7 @@ do_rotate() {
     if [[ "$za" == "200" ]]; then
       ok "exit $after, Zen HTTP 200 на '$model'"
       log_rotation "$before" "$after" "$zb" "$za" "$model" "$reason"
-      bounce_opencode
+      notify_client
       return 0
     fi
     warn "exit $after выдал HTTP $za, пробую другой"
@@ -203,7 +203,7 @@ do_on() {
   step "Zen HTTP: $code (модель $model)"
   if [[ "$code" == "200" ]]; then
     log_rotation "$before" "$after" "" "$code" "$model" "on"
-    bounce_opencode
+    notify_client
     ok "готово"
   else
     warn "Zen на $after отвечает $code. Запусти: $0 rotate"
@@ -215,7 +215,7 @@ do_off() {
   warp-cli disconnect >/dev/null 2>&1 || true
   sleep 1
   step "IP: $(cur_ip)"
-  bounce_opencode
+  notify_client
 }
 
 do_status() {
