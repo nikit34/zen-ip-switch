@@ -243,11 +243,21 @@ app_launch_direct() {
 sidecar_proxy_env() {
   local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
   [[ -z "$pid" ]] && { echo ""; return; }
-  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^(ALL_PROXY|HTTPS_PROXY|HTTP_PROXY)=" | sort -u | tr '\n' ' '
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^(ALL_PROXY|HTTPS_PROXY|HTTP_PROXY)=" | sort -u | tr '\n' ' ' || true
 }
 
 sidecar_has_proxy_env() {
   [[ -n "$(sidecar_proxy_env)" ]] && echo 1 || echo 0
+}
+
+ensure_sidecar_proxied() {
+  app_running || return 1
+  [[ "$(sidecar_has_proxy_env)" == "1" ]] && return 1
+  warn "сайдкар OpenCode ходит без прокси (перезапуск после автообновления?), ротация WARP его не касается"
+  start_privoxy
+  step "перезапускаю OpenCode.app с ALL_PROXY=$HTTP_PROXY_URL"
+  app_quit_wait && app_launch_with_proxy && ok "OpenCode.app запущен через HTTP-прокси"
+  return 0
 }
 
 privoxy_recent_targets() {
@@ -299,6 +309,11 @@ do_rotate() {
   local before; before=$(cur_ip_warp)
   local model; model=$(discover_free_model)
   local zb; zb=$(probe_zen "$model"); log_probe "$before" "$model" "$zb"
+  if ensure_sidecar_proxied && [[ "$zb" == "200" ]]; then
+    log_rotation "$before" "$before" "$zb" "$zb" "$model" "$reason:reproxy"
+    ok "exit $before отвечает 200, после перезапуска OpenCode пойдёт через него, ротация не нужна"
+    return 0
+  fi
   local after="" try=0 za=""
   for try in $(seq 1 "$MAX_ROTATE_TRIES"); do
     step "ротация $try/$MAX_ROTATE_TRIES: $before -> ..."
@@ -360,7 +375,7 @@ do_status() {
     if [[ -n "$env" ]]; then
       echo "запущен, env сайдкара: $env"
     else
-      echo "запущен, но у сайдкара нет *_PROXY env (сайдкар ходит прямо, в Zen будет 429)"
+      echo "запущен, но у сайдкара нет *_PROXY env (сайдкар ходит прямо, в Zen будет 429). Чинится: $0 on"
     fi
   else
     echo "не запущен"
@@ -406,6 +421,10 @@ do_daemon_loop() {
     if warp_connected && ! privoxy_running; then
       echo "$(date -u +%FT%TZ) privoxy мёртв, поднимаю заново"
       start_privoxy 2>&1 || echo "privoxy не стартовал"
+    fi
+    if warp_connected && app_running && [[ "$(sidecar_has_proxy_env)" == "0" ]]; then
+      echo "$(date -u +%FT%TZ) сайдкар без прокси, перезапускаю OpenCode через privoxy"
+      ensure_sidecar_proxied 2>&1
     fi
     if (( AUTO_OFF_IDLE_MINS > 0 )); then
       if app_running; then
