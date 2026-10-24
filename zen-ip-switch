@@ -8,6 +8,7 @@ STATE_DIR="${ZEN_STATE_DIR:-$HOME/.local/share/zen-ip-switch}"
 DB="$STATE_DIR/metrics.db"
 DAEMON_PID="$STATE_DIR/daemon.pid"
 DAEMON_LOG="$STATE_DIR/daemon.log"
+DAEMON_LOCK_DIR="$STATE_DIR/daemon.lock"
 APP_QUIT_WAIT="${ZEN_APP_QUIT_WAIT:-15}"
 NET_IFACE="${ZEN_NET_IFACE:-}"
 ZEN_PROXY_SCRIPT="${ZEN_PROXY_SCRIPT:-/Users/permi/zen-ip-switch/zen-proxy.js}"
@@ -143,18 +144,26 @@ signal_rotate() {
   log_rotation "sigusr1"
 }
 
-restart_app_if_stale_429() {
-  app_running || return 0
-  local a429 lrot
-  a429=$(app_last_429_ts)
-  lrot=$(last_rotation_ts)
-  (( a429 > lrot )) || return 0
-  app_quit_wait && app_launch_proxied
+acquire_daemon_lock() {
+  if ! mkdir "$DAEMON_LOCK_DIR" 2>/dev/null; then
+    local owner=""
+    [[ -f "$DAEMON_LOCK_DIR/pid" ]] && owner=$(cat "$DAEMON_LOCK_DIR/pid" 2>/dev/null || true)
+    if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+      echo "daemon уже запущен (pid=$owner)" >&2
+      return 1
+    fi
+    rmdir "$DAEMON_LOCK_DIR" 2>/dev/null || return 1
+    mkdir "$DAEMON_LOCK_DIR" 2>/dev/null || return 1
+  fi
+  echo "$$" > "$DAEMON_LOCK_DIR/pid"
+  echo "$$" > "$DAEMON_PID"
+  return 0
 }
 
 do_daemon_loop() {
   db_init
-  trap 'rm -f "$DAEMON_PID"' EXIT INT TERM
+  acquire_daemon_lock || exit 0
+  trap 'rm -f "$DAEMON_LOCK_DIR/pid" "$DAEMON_PID"; rmdir "$DAEMON_LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
   set +e
   while true; do
     local ts a429 lrot now gap today
@@ -169,9 +178,9 @@ do_daemon_loop() {
         echo "$ts свежий 429 но daily cap ($today/$MAX_PER_DAY), жду до завтра"
       else
         echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate signal, в сутках $((today+1))/$MAX_PER_DAY"
-        signal_rotate
-        sleep 3
-        restart_app_if_stale_429 >/dev/null 2>&1
+        if ! signal_rotate; then
+          echo "$ts rotate пропущен: zen-proxy недоступен или сигнал не отправлен"
+        fi
       fi
     fi
     sleep "$POLL_SECS"
@@ -179,21 +188,20 @@ do_daemon_loop() {
 }
 
 daemon_running() {
-  [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null
+  [[ -f "$DAEMON_LOCK_DIR/pid" ]] && kill -0 "$(cat "$DAEMON_LOCK_DIR/pid")" 2>/dev/null
 }
 
 daemon_start() {
   daemon_running && return 0
   nohup "$0" _loop >>"$DAEMON_LOG" 2>&1 &
-  echo $! > "$DAEMON_PID"
   disown || true
   sleep 1
   daemon_running
 }
 
 daemon_stop() {
-  [[ -f "$DAEMON_PID" ]] || return 0
-  local pid; pid=$(cat "$DAEMON_PID")
+  [[ -f "$DAEMON_LOCK_DIR/pid" ]] || { rm -f "$DAEMON_PID"; rmdir "$DAEMON_LOCK_DIR" 2>/dev/null || true; return 0; }
+  local pid; pid=$(cat "$DAEMON_LOCK_DIR/pid")
   if kill -0 "$pid" 2>/dev/null; then
     local child
     for child in $(pgrep -P "$pid" 2>/dev/null); do kill "$child" 2>/dev/null || true; done
@@ -201,7 +209,8 @@ daemon_stop() {
     sleep 0.3
     kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
   fi
-  rm -f "$DAEMON_PID"
+  rm -f "$DAEMON_LOCK_DIR/pid" "$DAEMON_PID"
+  rmdir "$DAEMON_LOCK_DIR" 2>/dev/null || true
 }
 
 do_on() {
