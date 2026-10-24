@@ -4,12 +4,10 @@ set -euo pipefail
 OPENCODE_APP_BIN="${ZEN_OPENCODE_APP_BIN:-/Applications/OpenCode.app/Contents/MacOS/OpenCode}"
 OPENCODE_PID_PAT="opencode-cli serve --service"
 OC_DB="${ZEN_OC_DB:-$HOME/.local/share/opencode/opencode.db}"
-ZEN_HOST="opencode.ai"
 STATE_DIR="${ZEN_STATE_DIR:-$HOME/.local/share/zen-ip-switch}"
 DB="$STATE_DIR/metrics.db"
 DAEMON_PID="$STATE_DIR/daemon.pid"
 DAEMON_LOG="$STATE_DIR/daemon.log"
-POLL_SECS="${ZEN_POLL_SECS:-5}"
 APP_QUIT_WAIT="${ZEN_APP_QUIT_WAIT:-15}"
 NET_IFACE="${ZEN_NET_IFACE:-}"
 ZEN_PROXY_SCRIPT="${ZEN_PROXY_SCRIPT:-/Users/permi/zen-ip-switch/zen-proxy.js}"
@@ -18,6 +16,10 @@ ZEN_PROXY_URL="http://127.0.0.1:${ZEN_PROXY_PORT}"
 ZEN_PROXY_PID="$STATE_DIR/zen-proxy.pid"
 ZEN_PROXY_LOG="$STATE_DIR/zen-proxy.log"
 NODE_BIN="${ZEN_NODE_BIN:-/opt/homebrew/bin/node}"
+
+POLL_SECS="${ZEN_POLL_SECS:-60}"
+MIN_INTERVAL_SECS="${ZEN_MIN_INTERVAL_SECS:-600}"
+MAX_PER_DAY="${ZEN_MAX_PER_DAY:-8}"
 
 mkdir -p "$STATE_DIR"
 
@@ -88,6 +90,11 @@ last_rotation_ts() {
   sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM rotations;" 2>/dev/null || echo 0
 }
 
+rotations_today() {
+  local day_start; day_start=$(date -v0H -v0M -v0S +%s)
+  sqlite3 "$DB" "SELECT COUNT(*) FROM rotations WHERE ts >= $day_start;" 2>/dev/null || echo 0
+}
+
 sidecar_proxy_env() {
   local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
   [[ -z "$pid" ]] && { echo ""; return; }
@@ -150,14 +157,22 @@ do_daemon_loop() {
   trap 'rm -f "$DAEMON_PID"' EXIT INT TERM
   set +e
   while true; do
-    local ts a429 lrot
+    local ts a429 lrot now gap today
     ts=$(date -u +%FT%TZ)
-    a429=$(app_last_429_ts); lrot=$(last_rotation_ts)
+    a429=$(app_last_429_ts); lrot=$(last_rotation_ts); now=$(date +%s)
     if (( a429 > lrot )); then
-      echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate signal"
-      signal_rotate
-      sleep 3
-      restart_app_if_stale_429 >/dev/null 2>&1
+      gap=$(( now - lrot ))
+      today=$(rotations_today)
+      if (( gap < MIN_INTERVAL_SECS )); then
+        echo "$ts свежий 429 но слишком рано ($gap < ${MIN_INTERVAL_SECS}s), жду"
+      elif (( today >= MAX_PER_DAY )); then
+        echo "$ts свежий 429 но daily cap ($today/$MAX_PER_DAY), жду до завтра"
+      else
+        echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate signal, в сутках $((today+1))/$MAX_PER_DAY"
+        signal_rotate
+        sleep 3
+        restart_app_if_stale_429 >/dev/null 2>&1
+      fi
     fi
     sleep "$POLL_SECS"
   done
@@ -195,14 +210,14 @@ do_on() {
   ipv6_wifi_on
   step "поднимаю zen-proxy ($ZEN_PROXY_URL)"
   if ! start_zen_proxy; then die "zen-proxy не стартовал, лог: $ZEN_PROXY_LOG"; fi
-  ok "zen-proxy pid=$(cat "$ZEN_PROXY_PID"), source /128 crypto'нулся"
+  ok "zen-proxy pid=$(cat "$ZEN_PROXY_PID"), источник один /128 на старте"
   if app_running && sidecar_proxied_to_zen; then
     ok "OpenCode уже через zen-proxy"
   else
     step "запуск OpenCode через zen-proxy"
     app_quit_wait && app_launch_proxied && ok "OpenCode.app через $ZEN_PROXY_URL"
   fi
-  step "фоновый daemon (poll ${POLL_SECS}s)"
+  step "safe-mode daemon (poll ${POLL_SECS}s, min-interval ${MIN_INTERVAL_SECS}s, max ${MAX_PER_DAY}/день)"
   daemon_start && ok "daemon pid=$(cat "$DAEMON_PID"), лог: $DAEMON_LOG"
 }
 
@@ -210,7 +225,7 @@ do_off() {
   db_init
   step "останавливаю daemon"
   daemon_stop
-  step "останавливаю zen-proxy (чистит свои /128)"
+  step "останавливаю zen-proxy (сам чистит /128)"
   stop_zen_proxy
   if app_running; then
     step "рестарт OpenCode (прямой выход)"
@@ -235,11 +250,16 @@ do_status() {
   else
     echo "stopped"
   fi
+  step "ротаций сегодня: $(rotations_today)/$MAX_PER_DAY (min-interval ${MIN_INTERVAL_SECS}s)"
+  local lrot; lrot=$(last_rotation_ts)
+  if (( lrot > 0 )); then
+    echo "последняя: $(date -r "$lrot" +'%Y-%m-%d %H:%M:%S')"
+  else
+    echo "ещё не было"
+  fi
   step "sidecar env"
   local env; env=$(sidecar_proxy_env)
   echo "${env:-нет сайдкара}"
-  step "последние 5 ротаций"
-  sqlite3 -column -header "$DB" "SELECT datetime(ts,'unixepoch','localtime') AS ts, reason FROM rotations ORDER BY ts DESC LIMIT 5;" 2>/dev/null
 }
 
 case "${1:-}" in
@@ -250,9 +270,10 @@ case "${1:-}" in
   *)
     cat <<EOF
 Usage: $0 <cmd>
-  on      включить IPv6, поднять zen-proxy (один /128 для opencode.ai), запустить OpenCode через него + фоновый daemon
-  off     остановить daemon и zen-proxy (почистить /128), рестарт OpenCode без прокси
-  status  состояние zen-proxy, daemon, sidecar, последние ротации
+  on      поднять zen-proxy (один /128 долгоживущий), OpenCode через него, safe-mode daemon
+          (ротирует /128 только при 429 в opencode.db, не чаще раза в ${MIN_INTERVAL_SECS}s, максимум ${MAX_PER_DAY}/день)
+  off     остановить daemon и zen-proxy, рестарт OpenCode без прокси
+  status  состояние, счётчик ротаций за сутки, последняя ротация
 EOF
     exit 1 ;;
 esac
