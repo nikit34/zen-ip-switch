@@ -1,27 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OPENCODE_PID_PAT="opencode-cli serve --service"
 OPENCODE_APP_BIN="${ZEN_OPENCODE_APP_BIN:-/Applications/OpenCode.app/Contents/MacOS/OpenCode}"
-IPIFY="https://api.ipify.org"
+OPENCODE_PID_PAT="opencode-cli serve --service"
 OC_DB="${ZEN_OC_DB:-$HOME/.local/share/opencode/opencode.db}"
 ZEN_HOST="opencode.ai"
-ZEN_BASE="https://${ZEN_HOST}/zen/v1"
 STATE_DIR="${ZEN_STATE_DIR:-$HOME/.local/share/zen-ip-switch}"
 DB="$STATE_DIR/metrics.db"
 DAEMON_PID="$STATE_DIR/daemon.pid"
 DAEMON_LOG="$STATE_DIR/daemon.log"
-POLL_SECS="${ZEN_POLL_SECS:-120}"
-IP_WAIT_SECS="${ZEN_IP_WAIT_SECS:-20}"
-MAX_ROTATE_TRIES="${ZEN_MAX_ROTATE_TRIES:-5}"
-WARP_PROXY_PORT="${ZEN_WARP_PROXY_PORT:-40000}"
-PRIVOXY_PORT="${ZEN_PRIVOXY_PORT:-8787}"
-PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
-PRIVOXY_PID="$STATE_DIR/privoxy.pid"
-PRIVOXY_LOG="$STATE_DIR/privoxy.log"
-HTTP_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
+POLL_SECS="${ZEN_POLL_SECS:-5}"
 APP_QUIT_WAIT="${ZEN_APP_QUIT_WAIT:-15}"
-AUTO_OFF_IDLE_MINS="${ZEN_AUTO_OFF_IDLE_MINS:-0}"
+NET_IFACE="${ZEN_NET_IFACE:-}"
+ZEN_PROXY_SCRIPT="${ZEN_PROXY_SCRIPT:-/Users/permi/zen-ip-switch/zen-proxy.js}"
+ZEN_PROXY_PORT="${ZEN_PROXY_PORT:-9999}"
+ZEN_PROXY_URL="http://127.0.0.1:${ZEN_PROXY_PORT}"
+ZEN_PROXY_PID="$STATE_DIR/zen-proxy.pid"
+ZEN_PROXY_LOG="$STATE_DIR/zen-proxy.log"
+NODE_BIN="${ZEN_NODE_BIN:-/opt/homebrew/bin/node}"
 
 mkdir -p "$STATE_DIR"
 
@@ -34,201 +30,15 @@ db_init() {
   sqlite3 "$DB" <<SQL
 CREATE TABLE IF NOT EXISTS rotations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  before_ip TEXT,
-  after_ip TEXT,
-  zen_before INTEGER,
-  zen_after INTEGER,
-  model TEXT,
-  reason TEXT
+  ts INTEGER NOT NULL, reason TEXT
 );
-CREATE TABLE IF NOT EXISTS probes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  ip TEXT,
-  model TEXT,
-  code INTEGER
-);
-CREATE INDEX IF NOT EXISTS probes_ts ON probes(ts);
 CREATE INDEX IF NOT EXISTS rotations_ts ON rotations(ts);
 SQL
 }
 
-sql_int() { [[ -n "$1" && "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo "NULL"; }
-sql_str() { local s="${1//\'/\'\'}"; echo "'$s'"; }
+log_rotation() { sqlite3 "$DB" "INSERT INTO rotations(ts,reason) VALUES ($(date +%s),'${1//\'/\'\'}');"; }
 
-log_probe() {
-  local ip="$1" model="$2" code="$3"
-  sqlite3 "$DB" "INSERT INTO probes(ts,ip,model,code) VALUES ($(date +%s),$(sql_str "$ip"),$(sql_str "$model"),$(sql_int "$code"));"
-}
-
-log_rotation() {
-  local b="$1" a="$2" zb="$3" za="$4" m="$5" r="$6"
-  sqlite3 "$DB" "INSERT INTO rotations(ts,before_ip,after_ip,zen_before,zen_after,model,reason) VALUES ($(date +%s),$(sql_str "$b"),$(sql_str "$a"),$(sql_int "$zb"),$(sql_int "$za"),$(sql_str "$m"),$(sql_str "$r"));"
-}
-
-warp_connected() {
-  warp-cli status 2>/dev/null | head -1 | grep -q "Connected"
-}
-
-privoxy_running() {
-  [[ -f "$PRIVOXY_PID" ]] && kill -0 "$(cat "$PRIVOXY_PID")" 2>/dev/null
-}
-
-cur_ip_direct() { curl -s --max-time 5 "$IPIFY" || echo ""; }
-cur_ip_warp()   { curl -s --socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}" --max-time 8 "https://${ZEN_HOST}/cdn-cgi/trace" | awk -F= '/^ip=/ {print $2}' || echo ""; }
-cur_ip_http()   { curl -s -x "$HTTP_PROXY_URL" --max-time 8 "$IPIFY" || echo ""; }
-
-discover_free_model() {
-  curl -s --max-time 10 "$ZEN_BASE/models" \
-    -H "User-Agent: opencode/2.0.24" \
-    | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("space-bunny-free"); sys.exit(0)
-free = [m["id"] for m in d.get("data", []) if isinstance(m, dict) and m.get("id","").endswith("-free")]
-free = [m for m in free if not m.startswith("jev-")]
-for pref in ("space-bunny-free","mimo-v2.6-flash-free","nemotron-3-ultra-free","longcat-2.5-preview-free"):
-    if pref in free: print(pref); sys.exit(0)
-print(free[0] if free else "space-bunny-free")
-' 2>/dev/null || echo "space-bunny-free"
-}
-
-probe_zen() {
-  local model="$1"
-  local proxy_arg=()
-  if warp_connected; then proxy_arg=(--socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}"); fi
-  curl -s -o /dev/null --max-time 12 "${proxy_arg[@]}" -w "%{http_code}" "$ZEN_BASE/chat/completions" \
-    -H "Authorization: Bearer public" \
-    -H "Content-Type: application/json" \
-    -H "x-opencode-session: ses_$(openssl rand -hex 13)" \
-    -H "User-Agent: opencode/2.0.24" \
-    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}"
-}
-
-ensure_warp() {
-  if command -v warp-cli >/dev/null; then return; fi
-  if ! command -v brew >/dev/null; then
-    die "brew не найден. Поставь Homebrew или WARP вручную: https://1.1.1.1"
-  fi
-  step "Ставлю Cloudflare WARP"
-  brew install --cask cloudflare-warp
-}
-
-ensure_proxy_mode() {
-  local mode; mode=$(warp-cli settings 2>/dev/null | awk '/^.*Mode:/ {print $NF; exit}')
-  if [[ "$mode" != "Proxy" && "$mode" != "proxy" ]]; then
-    step "перевожу WARP в proxy mode (SOCKS5 на 127.0.0.1:${WARP_PROXY_PORT})"
-    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
-    warp-cli mode proxy >/dev/null 2>&1 || die "не смог поставить proxy mode"
-    warp-cli proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
-  fi
-}
-
-ensure_privoxy() {
-  if command -v privoxy >/dev/null; then return; fi
-  if ! command -v brew >/dev/null; then
-    die "privoxy нет и brew нет. Поставь: brew install privoxy"
-  fi
-  step "ставлю privoxy (HTTP -> SOCKS мост)"
-  brew install privoxy
-}
-
-ensure_opencode_app() {
-  [[ -x "$OPENCODE_APP_BIN" ]] && return
-  die "OpenCode.app не найден: $OPENCODE_APP_BIN. Поставь из opencode.ai или укажи ZEN_OPENCODE_APP_BIN=/путь/к/бинарнику."
-}
-
-write_privoxy_conf() {
-  cat > "$PRIVOXY_CONF" <<EOF
-listen-address 127.0.0.1:${PRIVOXY_PORT}
-forward-socks5t / 127.0.0.1:${WARP_PROXY_PORT} .
-confdir $STATE_DIR
-logdir $STATE_DIR
-logfile privoxy.log
-toggle 1
-accept-intercepted-requests 0
-allow-cgi-request-crunching 0
-split-large-forms 0
-keep-alive-timeout 60
-tolerate-pipelining 1
-debug 1
-debug 512
-EOF
-}
-
-start_privoxy() {
-  if privoxy_running; then return; fi
-  write_privoxy_conf
-  privoxy "$PRIVOXY_CONF" >/dev/null 2>&1 || die "privoxy не стартовал (лог: $PRIVOXY_LOG)"
-  sleep 1
-  local pid; pid=$(pgrep -f "privoxy.*$PRIVOXY_CONF" | head -1 || true)
-  [[ -z "$pid" ]] && die "privoxy запустился, но pid не нашёл (лог: $PRIVOXY_LOG)"
-  echo "$pid" > "$PRIVOXY_PID"
-}
-
-stop_privoxy() {
-  [[ -f "$PRIVOXY_PID" ]] || return
-  local pid; pid=$(cat "$PRIVOXY_PID")
-  kill "$pid" 2>/dev/null || true
-  sleep 0.3
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-  rm -f "$PRIVOXY_PID"
-}
-
-warp_up() {
-  local before_warp_ip; before_warp_ip=$(cur_ip_warp)
-  warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect >/dev/null 2>&1 || true
-  for _ in $(seq 1 "$IP_WAIT_SECS"); do
-    sleep 1
-    warp_connected && { echo "$(cur_ip_warp)"; return 0; }
-  done
-  echo ""
-  return 1
-}
-
-warp_reregister() {
-  warp-cli disconnect >/dev/null 2>&1 || true
-  warp-cli registration delete >/dev/null 2>&1 || true
-  sleep 1
-  warp-cli --accept-tos registration new >/dev/null 2>&1 || return 1
-  warp-cli mode proxy >/dev/null 2>&1 || true
-  warp-cli proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
-}
-
-warp_rotate_exit() {
-  local before="$1"
-  warp_reregister || return 1
-  warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect >/dev/null 2>&1 || true
-  for _ in $(seq 1 "$IP_WAIT_SECS"); do
-    sleep 1
-    local now; now=$(cur_ip_warp)
-    if [[ -n "$now" && "$now" != "$before" ]]; then echo "$now"; return 0; fi
-  done
-  echo ""
-  return 1
-}
-
-app_last_429_ts() {
-  [[ -f "$OC_DB" ]] || { echo 0; return; }
-  sqlite3 "$OC_DB" "SELECT COALESCE(MAX(time_updated),0)/1000 FROM session_message WHERE json_extract(data,'$.error.status')=429 AND json_extract(data,'$.model.providerID')='opencode';" 2>/dev/null || echo 0
-}
-
-last_rotation_ts() {
-  sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM rotations WHERE reason NOT LIKE '%failed';" 2>/dev/null || echo 0
-}
-
-app_running()  { pgrep -f "$OPENCODE_APP_BIN" >/dev/null; }
-
-kill_sidecar() {
-  local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
-  [[ -z "$pid" ]] && return
-  kill "$pid" 2>/dev/null || true
-  sleep 1
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-}
+app_running() { pgrep -f "$OPENCODE_APP_BIN" >/dev/null; }
 
 app_quit_wait() {
   if app_running; then
@@ -238,301 +48,211 @@ app_quit_wait() {
       sleep 1; waited=$((waited+1))
       app_running || break
     done
-    if app_running; then
-      warn "OpenCode.app не закрылся за ${APP_QUIT_WAIT} сек"
-      return 1
-    fi
+    app_running && { warn "OpenCode.app не закрылся за ${APP_QUIT_WAIT} сек"; return 1; }
   fi
-  kill_sidecar
+  pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | xargs -r kill 2>/dev/null || true
   return 0
 }
 
-app_launch_with_proxy() {
+app_launch_direct() { open -a OpenCode; }
+app_launch_proxied() {
   open -a OpenCode \
-    --env "ALL_PROXY=$HTTP_PROXY_URL" \
-    --env "HTTPS_PROXY=$HTTP_PROXY_URL" \
-    --env "HTTP_PROXY=$HTTP_PROXY_URL"
+    --env "ALL_PROXY=$ZEN_PROXY_URL" \
+    --env "HTTPS_PROXY=$ZEN_PROXY_URL" \
+    --env "HTTP_PROXY=$ZEN_PROXY_URL"
 }
 
-app_launch_direct() {
-  open -a OpenCode
+detect_iface() {
+  if [[ -n "$NET_IFACE" ]]; then echo "$NET_IFACE"; return; fi
+  route -n get -inet default 2>/dev/null | awk '/interface:/ {print $2; exit}'
+}
+
+ipv6_prefix() {
+  local iface="$1"
+  ifconfig "$iface" 2>/dev/null \
+    | awk '/inet6 2[0-9a-f]/{for(i=1;i<=NF;i++) if($i=="inet6") print $(i+1)}' \
+    | awk -F: 'NF>=4 {printf "%s:%s:%s:%s\n",$1,$2,$3,$4; exit}'
+}
+
+ipv6_wifi_on() {
+  networksetup -getinfo "Wi-Fi" 2>/dev/null | grep -qE "^IPv6: (Automatic|Manual|LinkLocal)" \
+    || sudo -n networksetup -setv6automatic "Wi-Fi" 2>/dev/null
+}
+
+app_last_429_ts() {
+  [[ -f "$OC_DB" ]] || { echo 0; return; }
+  sqlite3 "$OC_DB" "SELECT COALESCE(MAX(time_updated),0)/1000 FROM session_message WHERE json_extract(data,'$.error.status')=429 AND json_extract(data,'$.model.providerID')='opencode';" 2>/dev/null || echo 0
+}
+
+last_rotation_ts() {
+  sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM rotations;" 2>/dev/null || echo 0
 }
 
 sidecar_proxy_env() {
   local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
   [[ -z "$pid" ]] && { echo ""; return; }
-  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^(ALL_PROXY|HTTPS_PROXY|HTTP_PROXY)=" | sort -u | tr '\n' ' ' || true
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^ALL_PROXY=" | head -1 | tr -d '\n'
 }
 
-sidecar_has_proxy_env() {
-  [[ -n "$(sidecar_proxy_env)" ]] && echo 1 || echo 0
+sidecar_proxied_to_zen() {
+  [[ "$(sidecar_proxy_env)" == "ALL_PROXY=$ZEN_PROXY_URL" ]]
 }
 
-ensure_sidecar_proxied() {
-  app_running || return 1
-  [[ "$(sidecar_has_proxy_env)" == "1" ]] && return 1
-  warn "сайдкар OpenCode ходит без прокси (перезапуск после автообновления?), ротация WARP его не касается"
-  start_privoxy
-  step "перезапускаю OpenCode.app с ALL_PROXY=$HTTP_PROXY_URL"
-  app_quit_wait && app_launch_with_proxy && ok "OpenCode.app запущен через HTTP-прокси"
-  return 0
+zen_proxy_running() {
+  [[ -f "$ZEN_PROXY_PID" ]] && kill -0 "$(cat "$ZEN_PROXY_PID")" 2>/dev/null
 }
 
-privoxy_recent_targets() {
-  [[ -f "$PRIVOXY_LOG" ]] || return
-  tail -n 300 "$PRIVOXY_LOG" 2>/dev/null \
-    | grep -E "Request:|Connect:" \
-    | awk '{for(i=1;i<=NF;i++) if ($i=="Request:" || $i=="Connect:") print $(i+1)}' \
-    | awk '!seen[$0]++' | tail -5
+start_zen_proxy() {
+  zen_proxy_running && return 0
+  local iface prefix
+  iface=$(detect_iface)
+  [[ -z "$iface" ]] && { warn "нет default route interface"; return 1; }
+  prefix=$(ipv6_prefix "$iface")
+  [[ -z "$prefix" ]] && { warn "нет IPv6 /64 на $iface, включи IPv6: sudo networksetup -setv6automatic Wi-Fi"; return 1; }
+  [[ -x "$NODE_BIN" ]] || { warn "нет node в $NODE_BIN"; return 1; }
+  [[ -f "$ZEN_PROXY_SCRIPT" ]] || { warn "нет $ZEN_PROXY_SCRIPT"; return 1; }
+  ZEN_IPV6_PREFIX="$prefix" ZEN_IFACE="$iface" ZEN_PROXY_PORT="$ZEN_PROXY_PORT" \
+    nohup "$NODE_BIN" "$ZEN_PROXY_SCRIPT" >>"$ZEN_PROXY_LOG" 2>&1 &
+  echo $! > "$ZEN_PROXY_PID"
+  disown || true
+  sleep 3
+  zen_proxy_running
 }
 
-do_on() {
-  db_init
-  ensure_opencode_app
-  ensure_warp
-  ensure_proxy_mode
-  ensure_privoxy
-  step "включаю WARP (proxy mode, SOCKS 127.0.0.1:${WARP_PROXY_PORT})"
-  local warp_ip; warp_ip=$(warp_up)
-  [[ -z "$warp_ip" ]] && die "WARP не поднялся. Открой приложение 1.1.1.1 вручную."
-  ok "WARP exit: $warp_ip (прямой IP остался $(cur_ip_direct))"
-  step "поднимаю privoxy ($HTTP_PROXY_URL -> socks5 WARP)"
-  start_privoxy
-  ok "privoxy pid=$(cat "$PRIVOXY_PID")"
-  local model; model=$(discover_free_model)
-  local code; code=$(probe_zen "$model"); log_probe "$warp_ip" "$model" "$code"
-  step "Zen через HTTP->SOCKS: HTTP $code (модель $model)"
-  if [[ "$code" == "429" ]]; then
-    warn "exit $warp_ip тоже выжат, запусти: $0 rotate"
-    return
+stop_zen_proxy() {
+  [[ -f "$ZEN_PROXY_PID" ]] || return 0
+  local pid; pid=$(cat "$ZEN_PROXY_PID")
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
   fi
-  log_rotation "$(cur_ip_direct)" "$warp_ip" "" "$code" "$model" "on"
-  if app_running; then
-    if [[ "$(sidecar_has_proxy_env)" == "1" ]]; then
-      ok "OpenCode уже стартован с прокси, перезапускать не надо"
-    else
-      step "перезапускаю OpenCode.app с ALL_PROXY=$HTTP_PROXY_URL"
-      app_quit_wait && app_launch_with_proxy && ok "OpenCode.app запущен через HTTP-прокси"
-    fi
-  else
-    step "OpenCode.app не запущен, стартую через HTTP-прокси"
-    app_launch_with_proxy && ok "OpenCode.app запущен"
-  fi
+  rm -f "$ZEN_PROXY_PID"
 }
 
-do_rotate() {
-  local reason="${1:-manual}"
-  db_init
-  warp_connected || die "WARP не в режиме Connected. Сначала: $0 on"
-  local before; before=$(cur_ip_warp)
-  local model; model=$(discover_free_model)
-  local zb; zb=$(probe_zen "$model"); log_probe "$before" "$model" "$zb"
-  if ensure_sidecar_proxied && [[ "$zb" != "429" ]]; then
-    log_rotation "$before" "$before" "$zb" "$zb" "$model" "$reason:reproxy"
-    ok "exit $before отвечает 200, после перезапуска OpenCode пойдёт через него, ротация не нужна"
-    return 0
-  fi
-  local after="" try=0 za=""
-  for try in $(seq 1 "$MAX_ROTATE_TRIES"); do
-    step "ротация $try/$MAX_ROTATE_TRIES: $before -> ..."
-    after=$(warp_rotate_exit "$before" || true)
-    [[ -z "$after" ]] && { warn "WARP не сменил exit на попытке $try"; continue; }
-    za=$(probe_zen "$model"); log_probe "$after" "$model" "$za"
-    if [[ "$za" == "429" ]]; then
-      warn "exit $after выдал HTTP 429, пробую другой"
-      before="$after"
-      continue
-    fi
-    ok "новый exit $after (пробник Zen: HTTP $za, 403 FreeTierError у пробника норма)"
-    log_rotation "$before" "$after" "$zb" "$za" "$model" "$reason"
-    return 0
-  done
-  log_rotation "$before" "${after:-}" "$zb" "0" "$model" "$reason:failed"
-  die "за $MAX_ROTATE_TRIES попыток не нашёл свободный exit. Подожди или ротни через час."
+signal_rotate() {
+  zen_proxy_running || return 1
+  kill -USR1 "$(cat "$ZEN_PROXY_PID")" 2>/dev/null || return 1
+  log_rotation "sigusr1"
 }
 
-do_off() {
-  db_init
-  step "выключаю WARP"
-  warp-cli disconnect >/dev/null 2>&1 || true
-  sleep 1
-  step "останавливаю privoxy"
-  stop_privoxy
-  step "IP: $(cur_ip_direct)"
-  if app_running && [[ "$(sidecar_has_proxy_env)" == "1" ]]; then
-    [[ -x "$OPENCODE_APP_BIN" ]] || { warn "OpenCode.app не найден, пропускаю перезапуск"; return; }
-    step "перезапускаю OpenCode.app без прокси (иначе будет ConnectionRefused на HTTP-прокси)"
-    app_quit_wait && app_launch_direct && ok "OpenCode.app запущен без прокси"
-  else
-    ok "OpenCode.app не нуждается в перезапуске"
-  fi
-}
-
-do_status() {
-  db_init
-  step "Публичный IP (прямой): $(cur_ip_direct)"
-  step "WARP"
-  if command -v warp-cli >/dev/null; then
-    warp-cli status 2>&1 | head -2
-    if warp_connected; then
-      step "WARP exit (через SOCKS :${WARP_PROXY_PORT}): $(cur_ip_warp)"
-    fi
-  else
-    echo "не установлен"
-  fi
-  step "privoxy"
-  if privoxy_running; then
-    echo "running pid=$(cat "$PRIVOXY_PID") на $HTTP_PROXY_URL"
-    step "WARP exit (через HTTP :$PRIVOXY_PORT): $(cur_ip_http)"
-  else
-    echo "stopped"
-  fi
-  step "OpenCode.app"
-  if app_running; then
-    local env; env=$(sidecar_proxy_env)
-    if [[ -n "$env" ]]; then
-      echo "запущен, env сайдкара: $env"
-    else
-      echo "запущен, но у сайдкара нет *_PROXY env (сайдкар ходит прямо, в Zen будет 429). Чинится: $0 on"
-    fi
-  else
-    echo "не запущен"
-  fi
-  step "Трафик через privoxy (последние 5 уникальных CONNECT)"
-  local targets; targets=$(privoxy_recent_targets 2>/dev/null || true)
-  if [[ -n "$targets" ]]; then
-    echo "$targets" | sed 's/^/  /'
-  else
-    echo "  нет данных (privoxy выключен или debug 512 не включен)"
-  fi
-  step "Daemon"
-  if [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
-    echo "running pid=$(cat "$DAEMON_PID")  log: $DAEMON_LOG"
-  else
-    echo "stopped"
-  fi
-  step "Пробный Zen"
-  local model; model=$(discover_free_model)
-  local code; code=$(probe_zen "$model")
-  local ip
-  if warp_connected; then ip=$(cur_ip_warp); else ip=$(cur_ip_direct); fi
-  log_probe "$ip" "$model" "$code"
-  echo "  модель $model через $(warp_connected && echo SOCKS || echo прямо) -> HTTP $code"
-}
-
-do_stats() {
-  db_init
-  step "Последние 10 ротаций"
-  sqlite3 -column -header "$DB" "SELECT datetime(ts,'unixepoch','localtime') AS ts, before_ip, after_ip, zen_before AS zb, zen_after AS za, model, reason FROM rotations ORDER BY ts DESC LIMIT 10;"
-  step "Распределение probe-кодов за 24 часа"
-  sqlite3 -column -header "$DB" "SELECT code, count(*) AS n FROM probes WHERE ts > strftime('%s','now','-1 day') GROUP BY code ORDER BY n DESC;"
-  step "Последние 10 probe"
-  sqlite3 -column -header "$DB" "SELECT datetime(ts,'unixepoch','localtime') AS ts, ip, model, code FROM probes ORDER BY ts DESC LIMIT 10;"
+restart_app_if_stale_429() {
+  app_running || return 0
+  local a429 lrot
+  a429=$(app_last_429_ts)
+  lrot=$(last_rotation_ts)
+  (( a429 > lrot )) || return 0
+  app_quit_wait && app_launch_proxied
 }
 
 do_daemon_loop() {
   db_init
   trap 'rm -f "$DAEMON_PID"' EXIT INT TERM
   set +e
-  local idle_cycles=0
   while true; do
-    if warp_connected && ! privoxy_running; then
-      echo "$(date -u +%FT%TZ) privoxy мёртв, поднимаю заново"
-      start_privoxy 2>&1 || echo "privoxy не стартовал"
-    fi
-    if warp_connected && app_running && [[ "$(sidecar_has_proxy_env)" == "0" ]]; then
-      echo "$(date -u +%FT%TZ) сайдкар без прокси, перезапускаю OpenCode через privoxy"
-      ensure_sidecar_proxied 2>&1
-    fi
-    if (( AUTO_OFF_IDLE_MINS > 0 )); then
-      if app_running; then
-        idle_cycles=0
-      else
-        idle_cycles=$((idle_cycles+1))
-        if (( idle_cycles * POLL_SECS >= AUTO_OFF_IDLE_MINS * 60 )); then
-          echo "$(date -u +%FT%TZ) OpenCode выключен ${AUTO_OFF_IDLE_MINS}+ мин, запускаю off и выхожу"
-          "$0" off 2>&1 || true
-          break
-        fi
-      fi
-    fi
-    local ts model ip code
+    local ts a429 lrot
     ts=$(date -u +%FT%TZ)
-    model=$(discover_free_model 2>/dev/null); [[ -z "$model" ]] && model="space-bunny-free"
-    if warp_connected; then ip=$(cur_ip_warp); else ip=$(cur_ip_direct); fi
-    code=$(probe_zen "$model"); [[ -z "$code" ]] && code=000
-    log_probe "$ip" "$model" "$code" 2>/dev/null
-    echo "$ts ip=$ip model=$model code=$code"
-    local app429; app429=$(app_last_429_ts)
-    if [[ "$code" == "429" ]] || (( app429 > $(last_rotation_ts) )); then
-      if warp_connected; then
-        echo "$ts -> 429 (пробник $code, последний 429 в OpenCode $(date -r "$app429" +%T 2>/dev/null)), запускаю rotate auto"
-        "$0" rotate auto 2>&1 || echo "$ts rotate failed"
-      else
-        echo "$ts -> 429 на прямом IP, но WARP выключен. Запусти: $0 on"
-      fi
+    a429=$(app_last_429_ts); lrot=$(last_rotation_ts)
+    if (( a429 > lrot )); then
+      echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate signal"
+      signal_rotate
+      sleep 3
+      restart_app_if_stale_429 >/dev/null 2>&1
     fi
     sleep "$POLL_SECS"
   done
 }
 
-do_daemon() {
-  db_init
-  if [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null; then
-    die "demon уже запущен, pid=$(cat "$DAEMON_PID")"
-  fi
-  ensure_warp
-  step "Запускаю демон (polling каждые $POLL_SECS сек, лог $DAEMON_LOG)"
+daemon_running() {
+  [[ -f "$DAEMON_PID" ]] && kill -0 "$(cat "$DAEMON_PID")" 2>/dev/null
+}
+
+daemon_start() {
+  daemon_running && return 0
   nohup "$0" _loop >>"$DAEMON_LOG" 2>&1 &
-  echo $! >"$DAEMON_PID"
+  echo $! > "$DAEMON_PID"
   disown || true
   sleep 1
-  ok "demon pid=$(cat "$DAEMON_PID")"
+  daemon_running
 }
 
-kill_tree() {
-  local pid="$1"
-  local child
-  for child in $(pgrep -P "$pid" 2>/dev/null); do
-    kill_tree "$child"
-  done
-  kill "$pid" 2>/dev/null || true
-  sleep 0.2
-  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-}
-
-do_daemon_stop() {
-  [[ -f "$DAEMON_PID" ]] || { warn "pid-файл не найден"; return; }
+daemon_stop() {
+  [[ -f "$DAEMON_PID" ]] || return 0
   local pid; pid=$(cat "$DAEMON_PID")
   if kill -0 "$pid" 2>/dev/null; then
-    kill_tree "$pid"
-    ok "demon pid=$pid и его дети остановлены"
-  else
-    warn "pid=$pid не живой"
+    local child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do kill "$child" 2>/dev/null || true; done
+    kill "$pid" 2>/dev/null || true
+    sleep 0.3
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$DAEMON_PID"
 }
 
+do_on() {
+  db_init
+  [[ -x "$OPENCODE_APP_BIN" ]] || die "OpenCode.app не найден: $OPENCODE_APP_BIN"
+  ipv6_wifi_on
+  step "поднимаю zen-proxy ($ZEN_PROXY_URL)"
+  if ! start_zen_proxy; then die "zen-proxy не стартовал, лог: $ZEN_PROXY_LOG"; fi
+  ok "zen-proxy pid=$(cat "$ZEN_PROXY_PID"), source /128 crypto'нулся"
+  if app_running && sidecar_proxied_to_zen; then
+    ok "OpenCode уже через zen-proxy"
+  else
+    step "запуск OpenCode через zen-proxy"
+    app_quit_wait && app_launch_proxied && ok "OpenCode.app через $ZEN_PROXY_URL"
+  fi
+  step "фоновый daemon (poll ${POLL_SECS}s)"
+  daemon_start && ok "daemon pid=$(cat "$DAEMON_PID"), лог: $DAEMON_LOG"
+}
+
+do_off() {
+  db_init
+  step "останавливаю daemon"
+  daemon_stop
+  step "останавливаю zen-proxy (чистит свои /128)"
+  stop_zen_proxy
+  if app_running; then
+    step "рестарт OpenCode (прямой выход)"
+    app_quit_wait && app_launch_direct && ok "OpenCode без прокси"
+  fi
+  ok "выключено"
+}
+
+do_status() {
+  db_init
+  step "zen-proxy"
+  if zen_proxy_running; then
+    echo "running pid=$(cat "$ZEN_PROXY_PID") на $ZEN_PROXY_URL"
+    tail -5 "$ZEN_PROXY_LOG" 2>/dev/null | sed 's/^/  /'
+  else
+    echo "stopped"
+  fi
+  step "daemon"
+  if daemon_running; then
+    echo "running pid=$(cat "$DAEMON_PID"), лог: $DAEMON_LOG"
+    tail -3 "$DAEMON_LOG" 2>/dev/null | sed 's/^/  /'
+  else
+    echo "stopped"
+  fi
+  step "sidecar env"
+  local env; env=$(sidecar_proxy_env)
+  echo "${env:-нет сайдкара}"
+  step "последние 5 ротаций"
+  sqlite3 -column -header "$DB" "SELECT datetime(ts,'unixepoch','localtime') AS ts, reason FROM rotations ORDER BY ts DESC LIMIT 5;" 2>/dev/null
+}
+
 case "${1:-}" in
-  status)         do_status ;;
-  on)             do_on ;;
-  off)            do_off ;;
-  rotate)         shift; do_rotate "${1:-manual}" ;;
-  stats)          do_stats ;;
-  daemon|start)   do_daemon ;;
-  stop)           do_daemon_stop ;;
-  _discover)      discover_free_model ;;
-  _loop)          do_daemon_loop ;;
+  on)     do_on ;;
+  off)    do_off ;;
+  status) do_status ;;
+  _loop)  do_daemon_loop ;;
   *)
     cat <<EOF
 Usage: $0 <cmd>
-  status           публичный IP, статус WARP SOCKS, OpenCode, пробный Zen
-  on               WARP proxy-mode + поднять SOCKS + перезапустить OpenCode.app с ALL_PROXY
-  off              выключить WARP + перезапустить OpenCode.app без прокси
-  rotate [reason]  переподключить WARP (новый exit), OpenCode не трогается
-  daemon           фоновый polling: при 429 на WARP exit автоматически ротирует
-  stop             остановить фоновый polling
-  stats            последние ротации и probe из SQLite ($DB)
+  on      включить IPv6, поднять zen-proxy (один /128 для opencode.ai), запустить OpenCode через него + фоновый daemon
+  off     остановить daemon и zen-proxy (почистить /128), рестарт OpenCode без прокси
+  status  состояние zen-proxy, daemon, sidecar, последние ротации
 EOF
     exit 1 ;;
 esac
