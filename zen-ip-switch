@@ -175,11 +175,11 @@ record_first_results() {
     elif [[ -n "$next" ]]; then
       sqlite3 "$DB" "UPDATE rotations SET first_status=0 WHERE id=$id;"
     fi
-  done < <(sqlite3 "$DB" "SELECT id, ts, (SELECT MIN(n.ts) FROM rotations n WHERE n.ts > r.ts) FROM rotations r WHERE first_status IS NULL ORDER BY ts;")
+  done < <(sqlite3 "$DB" "SELECT id, ts, (SELECT MIN(n.ts) FROM rotations n WHERE n.ts > r.ts) FROM rotations r WHERE first_status IS NULL AND reason NOT LIKE '%failed' ORDER BY ts;")
 }
 
 burnt_until_ts() {
-  sqlite3 "$DB" "SELECT COALESCE(MAX(first_ts) + $BURNT_PAUSE_SECS, 0) FROM rotations WHERE first_status=429 AND first_ts > $(( $(date +%s) - BURNT_PAUSE_SECS ));" 2>/dev/null || echo 0
+  sqlite3 "$DB" "SELECT COALESCE(MAX(ts) + $BURNT_PAUSE_SECS, 0) FROM rotations WHERE first_status=429 AND reason NOT LIKE '%failed' AND ts > $(( $(date +%s) - BURNT_PAUSE_SECS ));" 2>/dev/null || echo 0
 }
 
 first_status_label() {
