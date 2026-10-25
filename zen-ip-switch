@@ -16,6 +16,7 @@ PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
 PRIVOXY_PID="$STATE_DIR/privoxy.pid"
 PRIVOXY_LOG="$STATE_DIR/privoxy.log"
 ZEN_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
+ZEN_HOST="opencode.ai"
 
 POLL_SECS="${ZEN_POLL_SECS:-60}"
 MIN_INTERVAL_SECS="${ZEN_MIN_INTERVAL_SECS:-600}"
@@ -103,8 +104,10 @@ ensure_privoxy() {
 
 privoxy_running() {
   if [[ -f "$PRIVOXY_PID" ]] && kill -0 "$(cat "$PRIVOXY_PID")" 2>/dev/null; then return 0; fi
-  local pid; pid=$(pgrep -x privoxy | head -1 || true)
-  [[ -n "$pid" ]] && { echo "$pid" > "$PRIVOXY_PID"; return 0; }
+  rm -f "$PRIVOXY_PID"
+  # проверяем, кто слушает наш порт (не подхватываем чужой privoxy на другом порту)
+  local pid; pid=$(lsof -tiTCP:"$PRIVOXY_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+  if [[ -n "$pid" ]]; then echo "$pid" > "$PRIVOXY_PID"; return 0; fi
   return 1
 }
 
@@ -148,7 +151,7 @@ app_last_429_ts() {
 }
 
 last_rotation_ts() {
-  sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM rotations;" 2>/dev/null || echo 0
+  sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM rotations WHERE reason NOT LIKE '%failed';" 2>/dev/null || echo 0
 }
 
 rotations_today() {
@@ -188,6 +191,32 @@ first_status_label() {
   esac
 }
 
+cur_ip_warp() { curl -s --socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}" --max-time 8 "https://${ZEN_HOST}/cdn-cgi/trace" 2>/dev/null | awk -F= '/^ip=/ {print $2}' || echo ""; }
+
+warp_reregister() {
+  warp-cli disconnect >/dev/null 2>&1 || true
+  warp-cli registration delete >/dev/null 2>&1 || true
+  sleep 1
+  warp-cli --accept-tos registration new >/dev/null 2>&1 || return 1
+  warp-cli mode proxy >/dev/null 2>&1 || true
+  warp-cli proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
+  return 0
+}
+
+warp_rotate_exit() {
+  local before="$1"
+  warp_reregister || return 1
+  warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect >/dev/null 2>&1 || true
+  local i now
+  for i in $(seq 1 20); do
+    sleep 1
+    now=$(cur_ip_warp)
+    if [[ -n "$now" && "$now" != "$before" ]]; then echo "$now"; return 0; fi
+  done
+  echo ""
+  return 1
+}
+
 do_rotate() {
   local reason="${1:-manual}"
   db_init
@@ -197,19 +226,23 @@ do_rotate() {
     local i
     for i in $(seq 1 20); do warp_connected && break; sleep 1; done
   fi
-  warp_connected || die "WARP не подключился"
-  # переподключаем для нового exit
-  warp-cli disconnect >/dev/null 2>&1 || true
-  sleep 2
-  warp-cli connect >/dev/null 2>&1 || true
-  local i
-  for i in $(seq 1 20); do warp_connected && break; sleep 1; done
-  warp_connected || die "WARP не подключился после ротации"
-  start_privoxy || die "privoxy не стартовал"
-  local newip
-  newip=$(curl -sx "$ZEN_PROXY_URL" -s --max-time 10 https://opencode.ai/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2 || true)
-  [[ -n "$newip" ]] && ok "WARP exit: $newip" || warn "не удалось получить exit IP"
+  if ! warp_connected; then
+    echo "rotate failed: WARP не подключился" >&2
+    log_rotation "${reason}:failed"
+    return 1
+  fi
+  local before; before=$(cur_ip_warp)
+  [[ -z "$before" ]] && { echo "rotate failed: не удалось получить текущий exit" >&2; log_rotation "${reason}:failed"; return 1; }
+  start_privoxy || { echo "rotate failed: privoxy не стартовал" >&2; log_rotation "${reason}:failed"; return 1; }
+  local after; after=$(warp_rotate_exit "$before")
+  if [[ -z "$after" ]]; then
+    echo "rotate failed: exit не изменился ($before)" >&2
+    log_rotation "${reason}:failed"
+    return 1
+  fi
+  ok "WARP exit: $before -> $after"
   log_rotation "$reason"
+  return 0
 }
 
 acquire_daemon_lock() {
@@ -239,7 +272,13 @@ do_daemon_loop() {
     record_first_results
     a429=$(app_last_429_ts); lrot=$(last_rotation_ts); now=$(date +%s)
     # самоподнимаем privoxy
-    privoxy_running || start_privoxy >/dev/null 2>&1 || true
+    if ! privoxy_running; then
+      if start_privoxy >/dev/null 2>&1; then
+        echo "$ts privoxy был мёртв, поднят pid=$(cat "$PRIVOXY_PID" 2>/dev/null)"
+      else
+        echo "$ts privoxy не поднялся"
+      fi
+    fi
     if (( a429 > lrot )); then
       gap=$(( now - lrot ))
       today=$(rotations_today)
@@ -252,7 +291,7 @@ do_daemon_loop() {
         echo "$ts свежий 429 но daily cap ($today/$MAX_PER_DAY), жду до завтра"
       else
         echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate, в сутках $((today+1))/$MAX_PER_DAY"
-        do_rotate "auto429" >/dev/null 2>&1 || echo "$ts rotate failed"
+        do_rotate "auto429" || echo "$ts rotate failed"
       fi
     fi
     sleep "$POLL_SECS"
