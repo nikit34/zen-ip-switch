@@ -20,6 +20,7 @@ ZEN_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
 POLL_SECS="${ZEN_POLL_SECS:-60}"
 MIN_INTERVAL_SECS="${ZEN_MIN_INTERVAL_SECS:-600}"
 MAX_PER_DAY="${ZEN_MAX_PER_DAY:-8}"
+BURNT_PAUSE_SECS="${ZEN_BURNT_PAUSE_SECS:-14400}"
 
 mkdir -p "$STATE_DIR"
 
@@ -32,10 +33,14 @@ db_init() {
   sqlite3 "$DB" <<SQL
 CREATE TABLE IF NOT EXISTS rotations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL, reason TEXT
+  ts INTEGER NOT NULL, reason TEXT,
+  first_ts INTEGER, first_status INTEGER
 );
 CREATE INDEX IF NOT EXISTS rotations_ts ON rotations(ts);
 SQL
+  if [[ -z "$(sqlite3 "$DB" "SELECT 1 FROM pragma_table_info('rotations') WHERE name='first_status';")" ]]; then
+    sqlite3 "$DB" "ALTER TABLE rotations ADD COLUMN first_ts INTEGER; ALTER TABLE rotations ADD COLUMN first_status INTEGER;"
+  fi
 }
 
 log_rotation() { sqlite3 "$DB" "INSERT INTO rotations(ts,reason) VALUES ($(date +%s),'${1//\'/\'\'}');"; }
@@ -151,6 +156,38 @@ rotations_today() {
   sqlite3 "$DB" "SELECT COUNT(*) FROM rotations WHERE ts >= $day_start;" 2>/dev/null || echo 0
 }
 
+first_request_after() {
+  local from="$1" to="$2"
+  sqlite3 "$OC_DB" "SELECT time_created/1000, COALESCE(json_extract(data,'$.error.status'),200) FROM session_message WHERE type='assistant' AND json_extract(data,'$.model.providerID')='opencode' AND time_created >= $((from * 1000)) AND time_created < $((to * 1000)) AND json_extract(data,'$.time.completed') IS NOT NULL AND (json_extract(data,'$.finish') IS NOT 'error' OR json_extract(data,'$.error.status') IS NOT NULL) ORDER BY time_created LIMIT 1;" 2>/dev/null
+}
+
+record_first_results() {
+  [[ -f "$OC_DB" ]] || return 0
+  local id ts next row
+  while IFS='|' read -r id ts next; do
+    row=$(first_request_after "$ts" "${next:-$(date +%s)}") || continue
+    if [[ -n "$row" ]]; then
+      sqlite3 "$DB" "UPDATE rotations SET first_ts=${row%%|*}, first_status=${row##*|} WHERE id=$id;"
+      echo "$(date -u -r "$ts" +%FT%TZ) ротация: первый запрос $(date -u -r "${row%%|*}" +%TZ) -> ${row##*|}"
+    elif [[ -n "$next" ]]; then
+      sqlite3 "$DB" "UPDATE rotations SET first_status=0 WHERE id=$id;"
+    fi
+  done < <(sqlite3 "$DB" "SELECT id, ts, (SELECT MIN(n.ts) FROM rotations n WHERE n.ts > r.ts) FROM rotations r WHERE first_status IS NULL ORDER BY ts;")
+}
+
+burnt_until_ts() {
+  sqlite3 "$DB" "SELECT COALESCE(MAX(first_ts) + $BURNT_PAUSE_SECS, 0) FROM rotations WHERE first_status=429 AND first_ts > $(( $(date +%s) - BURNT_PAUSE_SECS ));" 2>/dev/null || echo 0
+}
+
+first_status_label() {
+  case "$1" in
+    "")  echo "запросов ещё не было" ;;
+    0)   echo "до следующей ротации запросов не было" ;;
+    200) echo "OK" ;;
+    *)   echo "HTTP $1" ;;
+  esac
+}
+
 do_rotate() {
   local reason="${1:-manual}"
   db_init
@@ -197,15 +234,19 @@ do_daemon_loop() {
   trap 'rm -f "$DAEMON_LOCK_DIR/pid" "$DAEMON_PID"; rmdir "$DAEMON_LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
   set +e
   while true; do
-    local ts a429 lrot now gap today
+    local ts a429 lrot now gap today burnt
     ts=$(date -u +%FT%TZ)
+    record_first_results
     a429=$(app_last_429_ts); lrot=$(last_rotation_ts); now=$(date +%s)
     # самоподнимаем privoxy
     privoxy_running || start_privoxy >/dev/null 2>&1 || true
     if (( a429 > lrot )); then
       gap=$(( now - lrot ))
       today=$(rotations_today)
-      if (( gap < MIN_INTERVAL_SECS )); then
+      burnt=$(burnt_until_ts)
+      if (( burnt > 0 )); then
+        echo "$ts свежий 429 но новый exit сразу получил 429, ротации стоят до $(date -r "$burnt" +%T)"
+      elif (( gap < MIN_INTERVAL_SECS )); then
         echo "$ts свежий 429 но слишком рано ($gap < ${MIN_INTERVAL_SECS}s), жду"
       elif (( today >= MAX_PER_DAY )); then
         echo "$ts свежий 429 но daily cap ($today/$MAX_PER_DAY), жду до завтра"
@@ -301,12 +342,17 @@ do_status() {
   else
     echo "stopped"
   fi
+  record_first_results >/dev/null
   step "ротаций сегодня: $(rotations_today)/$MAX_PER_DAY (min-interval ${MIN_INTERVAL_SECS}s)"
   local lrot; lrot=$(last_rotation_ts)
   if (( lrot > 0 )); then
-    echo "последняя: $(date -r "$lrot" +'%Y-%m-%d %H:%M:%S')"
+    echo "последняя: $(date -r "$lrot" +'%Y-%m-%d %H:%M:%S'), первый запрос после неё: $(first_status_label "$(sqlite3 "$DB" "SELECT first_status FROM rotations WHERE ts=$lrot ORDER BY id DESC LIMIT 1;")")"
   else
     echo "ещё не было"
+  fi
+  local burnt; burnt=$(burnt_until_ts)
+  if (( burnt > 0 )); then
+    warn "ротации стоят до $(date -r "$burnt" +%T): новый exit сразу получил 429 (пауза ${BURNT_PAUSE_SECS}s)"
   fi
   step "sidecar env"
   local env; env=$(sidecar_proxy_env)
