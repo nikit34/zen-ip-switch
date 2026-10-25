@@ -10,13 +10,12 @@ DAEMON_PID="$STATE_DIR/daemon.pid"
 DAEMON_LOG="$STATE_DIR/daemon.log"
 DAEMON_LOCK_DIR="$STATE_DIR/daemon.lock"
 APP_QUIT_WAIT="${ZEN_APP_QUIT_WAIT:-15}"
-NET_IFACE="${ZEN_NET_IFACE:-}"
-ZEN_PROXY_SCRIPT="${ZEN_PROXY_SCRIPT:-/Users/permi/zen-ip-switch/zen-proxy.js}"
-ZEN_PROXY_PORT="${ZEN_PROXY_PORT:-9999}"
-ZEN_PROXY_URL="http://127.0.0.1:${ZEN_PROXY_PORT}"
-ZEN_PROXY_PID="$STATE_DIR/zen-proxy.pid"
-ZEN_PROXY_LOG="$STATE_DIR/zen-proxy.log"
-NODE_BIN="${ZEN_NODE_BIN:-/opt/homebrew/bin/node}"
+WARP_PROXY_PORT="${ZEN_WARP_PROXY_PORT:-40000}"
+PRIVOXY_PORT="${ZEN_PRIVOXY_PORT:-8787}"
+PRIVOXY_CONF="$STATE_DIR/privoxy.conf"
+PRIVOXY_PID="$STATE_DIR/privoxy.pid"
+PRIVOXY_LOG="$STATE_DIR/privoxy.log"
+ZEN_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
 
 POLL_SECS="${ZEN_POLL_SECS:-60}"
 MIN_INTERVAL_SECS="${ZEN_MIN_INTERVAL_SECS:-600}"
@@ -65,21 +64,77 @@ app_launch_proxied() {
     --env "HTTP_PROXY=$ZEN_PROXY_URL"
 }
 
-detect_iface() {
-  if [[ -n "$NET_IFACE" ]]; then echo "$NET_IFACE"; return; fi
-  route -n get -inet default 2>/dev/null | awk '/interface:/ {print $2; exit}'
+warp_connected() { warp-cli status 2>/dev/null | grep -q "Connected"; }
+
+ensure_warp_proxy_mode() {
+  warp-cli mode proxy >/dev/null 2>&1 || true
+  warp-cli proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
 }
 
-ipv6_prefix() {
-  local iface="$1"
-  ifconfig "$iface" 2>/dev/null \
-    | awk '/inet6 2[0-9a-f]/{for(i=1;i<=NF;i++) if($i=="inet6") print $(i+1)}' \
-    | awk -F: 'NF>=4 {printf "%s:%s:%s:%s\n",$1,$2,$3,$4; exit}'
+write_privoxy_conf() {
+  cat > "$PRIVOXY_CONF" <<EOF
+listen-address 127.0.0.1:${PRIVOXY_PORT}
+forward-socks5t / 127.0.0.1:${WARP_PROXY_PORT} .
+confdir ${STATE_DIR}
+logdir ${STATE_DIR}
+logfile privoxy.log
+toggle 1
+accept-intercepted-requests 0
+allow-cgi-request-crunching 0
+split-large-forms 0
+keep-alive-timeout 60
+tolerate-pipelining 1
+debug 1
+debug 512
+EOF
 }
 
-ipv6_wifi_on() {
-  networksetup -getinfo "Wi-Fi" 2>/dev/null | grep -qE "^IPv6: (Automatic|Manual|LinkLocal)" \
-    || sudo -n networksetup -setv6automatic "Wi-Fi" 2>/dev/null
+ensure_privoxy() {
+  if ! command -v privoxy >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then brew install privoxy >/dev/null 2>&1 || die "не удалось установить privoxy"; else die "privoxy не найден"; fi
+  fi
+  [[ -f "$PRIVOXY_CONF" ]] || write_privoxy_conf
+}
+
+privoxy_running() {
+  if [[ -f "$PRIVOXY_PID" ]] && kill -0 "$(cat "$PRIVOXY_PID")" 2>/dev/null; then return 0; fi
+  local pid; pid=$(pgrep -x privoxy | head -1 || true)
+  [[ -n "$pid" ]] && { echo "$pid" > "$PRIVOXY_PID"; return 0; }
+  return 1
+}
+
+start_privoxy() {
+  privoxy_running && return 0
+  ensure_privoxy
+  write_privoxy_conf
+  /opt/homebrew/sbin/privoxy "$PRIVOXY_CONF" >/dev/null 2>&1 || /usr/local/sbin/privoxy "$PRIVOXY_CONF" >/dev/null 2>&1 || privoxy "$PRIVOXY_CONF" >/dev/null 2>&1 || true
+  sleep 1
+  local pid; pid=$(pgrep -x privoxy | head -1 || true)
+  [[ -n "$pid" ]] && echo "$pid" > "$PRIVOXY_PID"
+  privoxy_running
+}
+
+stop_privoxy() {
+  local pid=""
+  [[ -f "$PRIVOXY_PID" ]] && pid=$(cat "$PRIVOXY_PID" 2>/dev/null || true)
+  [[ -z "$pid" ]] && pid=$(pgrep -x privoxy | head -1 || true)
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PRIVOXY_PID"
+  pkill -x privoxy 2>/dev/null || true
+}
+
+sidecar_proxy_env() {
+  local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
+  [[ -z "$pid" ]] && { echo ""; return; }
+  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^ALL_PROXY=" | head -1 | tr -d '\n'
+}
+
+sidecar_proxied_to_zen() {
+  [[ "$(sidecar_proxy_env)" == "ALL_PROXY=$ZEN_PROXY_URL" ]]
 }
 
 app_last_429_ts() {
@@ -96,52 +151,28 @@ rotations_today() {
   sqlite3 "$DB" "SELECT COUNT(*) FROM rotations WHERE ts >= $day_start;" 2>/dev/null || echo 0
 }
 
-sidecar_proxy_env() {
-  local pid; pid=$(pgrep -f "$OPENCODE_PID_PAT" 2>/dev/null | head -1 || true)
-  [[ -z "$pid" ]] && { echo ""; return; }
-  ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -E "^ALL_PROXY=" | head -1 | tr -d '\n'
-}
-
-sidecar_proxied_to_zen() {
-  [[ "$(sidecar_proxy_env)" == "ALL_PROXY=$ZEN_PROXY_URL" ]]
-}
-
-zen_proxy_running() {
-  [[ -f "$ZEN_PROXY_PID" ]] && kill -0 "$(cat "$ZEN_PROXY_PID")" 2>/dev/null
-}
-
-start_zen_proxy() {
-  zen_proxy_running && return 0
-  local iface prefix
-  iface=$(detect_iface)
-  [[ -z "$iface" ]] && { warn "нет default route interface"; return 1; }
-  prefix=$(ipv6_prefix "$iface")
-  [[ -z "$prefix" ]] && { warn "нет IPv6 /64 на $iface, включи IPv6: sudo networksetup -setv6automatic Wi-Fi"; return 1; }
-  [[ -x "$NODE_BIN" ]] || { warn "нет node в $NODE_BIN"; return 1; }
-  [[ -f "$ZEN_PROXY_SCRIPT" ]] || { warn "нет $ZEN_PROXY_SCRIPT"; return 1; }
-  ZEN_IPV6_PREFIX="$prefix" ZEN_IFACE="$iface" ZEN_PROXY_PORT="$ZEN_PROXY_PORT" \
-    nohup "$NODE_BIN" "$ZEN_PROXY_SCRIPT" >>"$ZEN_PROXY_LOG" 2>&1 &
-  echo $! > "$ZEN_PROXY_PID"
-  disown || true
-  sleep 3
-  zen_proxy_running
-}
-
-stop_zen_proxy() {
-  [[ -f "$ZEN_PROXY_PID" ]] || return 0
-  local pid; pid=$(cat "$ZEN_PROXY_PID")
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    sleep 2
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+do_rotate() {
+  local reason="${1:-manual}"
+  db_init
+  ensure_warp_proxy_mode
+  if ! warp_connected; then
+    warp-cli connect >/dev/null 2>&1 || true
+    local i
+    for i in $(seq 1 20); do warp_connected && break; sleep 1; done
   fi
-  rm -f "$ZEN_PROXY_PID"
-}
-
-signal_rotate() {
-  zen_proxy_running || return 1
-  kill -USR1 "$(cat "$ZEN_PROXY_PID")" 2>/dev/null || return 1
-  log_rotation "sigusr1"
+  warp_connected || die "WARP не подключился"
+  # переподключаем для нового exit
+  warp-cli disconnect >/dev/null 2>&1 || true
+  sleep 2
+  warp-cli connect >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 20); do warp_connected && break; sleep 1; done
+  warp_connected || die "WARP не подключился после ротации"
+  start_privoxy || die "privoxy не стартовал"
+  local newip
+  newip=$(curl -sx "$ZEN_PROXY_URL" -s --max-time 10 https://opencode.ai/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2 || true)
+  [[ -n "$newip" ]] && ok "WARP exit: $newip" || warn "не удалось получить exit IP"
+  log_rotation "$reason"
 }
 
 acquire_daemon_lock() {
@@ -169,6 +200,8 @@ do_daemon_loop() {
     local ts a429 lrot now gap today
     ts=$(date -u +%FT%TZ)
     a429=$(app_last_429_ts); lrot=$(last_rotation_ts); now=$(date +%s)
+    # самоподнимаем privoxy
+    privoxy_running || start_privoxy >/dev/null 2>&1 || true
     if (( a429 > lrot )); then
       gap=$(( now - lrot ))
       today=$(rotations_today)
@@ -177,10 +210,8 @@ do_daemon_loop() {
       elif (( today >= MAX_PER_DAY )); then
         echo "$ts свежий 429 но daily cap ($today/$MAX_PER_DAY), жду до завтра"
       else
-        echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate signal, в сутках $((today+1))/$MAX_PER_DAY"
-        if ! signal_rotate; then
-          echo "$ts rotate пропущен: zen-proxy недоступен или сигнал не отправлен"
-        fi
+        echo "$ts свежий 429 ($(date -r "$a429" +%T)), rotate, в сутках $((today+1))/$MAX_PER_DAY"
+        do_rotate "auto429" >/dev/null 2>&1 || echo "$ts rotate failed"
       fi
     fi
     sleep "$POLL_SECS"
@@ -216,17 +247,25 @@ daemon_stop() {
 do_on() {
   db_init
   [[ -x "$OPENCODE_APP_BIN" ]] || die "OpenCode.app не найден: $OPENCODE_APP_BIN"
-  ipv6_wifi_on
-  step "поднимаю zen-proxy ($ZEN_PROXY_URL)"
-  if ! start_zen_proxy; then die "zen-proxy не стартовал, лог: $ZEN_PROXY_LOG"; fi
-  ok "zen-proxy pid=$(cat "$ZEN_PROXY_PID"), источник один /128 на старте"
+  ensure_warp_proxy_mode
+  step "подключаю WARP (proxy-mode)"
+  if ! warp_connected; then
+    warp-cli connect >/dev/null 2>&1 || true
+    local i
+    for i in $(seq 1 20); do warp_connected && break; sleep 1; done
+  fi
+  warp_connected || die "WARP не подключился"
+  ok "WARP connected"
+  step "поднимаю privoxy (HTTP->SOCKS мост)"
+  if ! start_privoxy; then die "privoxy не стартовал, лог: $PRIVOXY_LOG"; fi
+  ok "privoxy pid=$(cat "$PRIVOXY_PID") на $ZEN_PROXY_URL"
   if app_running && sidecar_proxied_to_zen; then
-    ok "OpenCode уже через zen-proxy"
+    ok "OpenCode уже через privoxy"
   else
-    step "запуск OpenCode через zen-proxy"
+    step "запуск OpenCode через privoxy"
     app_quit_wait && app_launch_proxied && ok "OpenCode.app через $ZEN_PROXY_URL"
   fi
-  step "safe-mode daemon (poll ${POLL_SECS}s, min-interval ${MIN_INTERVAL_SECS}s, max ${MAX_PER_DAY}/день)"
+  step "daemon (poll ${POLL_SECS}s, min-interval ${MIN_INTERVAL_SECS}s, max ${MAX_PER_DAY}/день)"
   daemon_start && ok "daemon pid=$(cat "$DAEMON_PID"), лог: $DAEMON_LOG"
 }
 
@@ -234,8 +273,10 @@ do_off() {
   db_init
   step "останавливаю daemon"
   daemon_stop
-  step "останавливаю zen-proxy (сам чистит /128)"
-  stop_zen_proxy
+  step "останавливаю privoxy"
+  stop_privoxy
+  step "отключаю WARP"
+  warp-cli disconnect >/dev/null 2>&1 || true
   if app_running; then
     step "рестарт OpenCode (прямой выход)"
     app_quit_wait && app_launch_direct && ok "OpenCode без прокси"
@@ -245,10 +286,11 @@ do_off() {
 
 do_status() {
   db_init
-  step "zen-proxy"
-  if zen_proxy_running; then
-    echo "running pid=$(cat "$ZEN_PROXY_PID") на $ZEN_PROXY_URL"
-    tail -5 "$ZEN_PROXY_LOG" 2>/dev/null | sed 's/^/  /'
+  step "WARP"
+  if warp_connected; then echo "connected (proxy-mode :$WARP_PROXY_PORT)"; else echo "disconnected"; fi
+  step "privoxy"
+  if privoxy_running; then
+    echo "running pid=$(cat "$PRIVOXY_PID") на $ZEN_PROXY_URL"
   else
     echo "stopped"
   fi
@@ -269,20 +311,23 @@ do_status() {
   step "sidecar env"
   local env; env=$(sidecar_proxy_env)
   echo "${env:-нет сайдкара}"
+  step "exit IP"
+  curl -sx "$ZEN_PROXY_URL" -s --max-time 5 https://opencode.ai/cdn-cgi/trace 2>/dev/null | grep '^ip=' || echo "n/a"
 }
 
 case "${1:-}" in
   on)     do_on ;;
   off)    do_off ;;
   status) do_status ;;
+  rotate) do_rotate "${2:-manual}" ;;
   _loop)  do_daemon_loop ;;
   *)
     cat <<EOF
 Usage: $0 <cmd>
-  on      поднять zen-proxy (один /128 долгоживущий), OpenCode через него, safe-mode daemon
-          (ротирует /128 только при 429 в opencode.db, не чаще раза в ${MIN_INTERVAL_SECS}s, максимум ${MAX_PER_DAY}/день)
-  off     остановить daemon и zen-proxy, рестарт OpenCode без прокси
-  status  состояние, счётчик ротаций за сутки, последняя ротация
+  on      поднять WARP proxy-mode + privoxy + перезапуск OpenCode с ALL_PROXY
+  off     отключить WARP + privoxy + рестарт OpenCode без прокси
+  status  состояние
+  rotate  переподключить WARP (новый exit), OpenCode не трогается
 EOF
     exit 1 ;;
 esac
