@@ -162,7 +162,7 @@ last_rotation_ts() {
 
 rotations_today() {
   local day_start; day_start=$(date -v0H -v0M -v0S +%s)
-  sqlite3 "$DB" "SELECT COUNT(*) FROM rotations WHERE ts >= $day_start;" 2>/dev/null || echo 0
+  sqlite3 "$DB" "SELECT COUNT(*) FROM rotations WHERE ts >= $day_start AND reason NOT LIKE '%failed';" 2>/dev/null || echo 0
 }
 
 first_request_after() {
@@ -181,7 +181,8 @@ record_first_results() {
       fstatus="${row%%|*}"; row="${row#*|}"
       fretry="${row%%|*}"; row="${row#*|}"
       fmodel="$row"
-      sqlite3 "$DB" "UPDATE rotations SET first_ts=$fts, first_status=$fstatus, first_retry_ms=$fretry, first_model='$fmodel' WHERE id=$id;"
+      local fmodel_esc; fmodel_esc="${fmodel//\'/\'\'}"
+      sqlite3 "$DB" "UPDATE rotations SET first_ts=$fts, first_status=$fstatus, first_retry_ms=$fretry, first_model='$fmodel_esc' WHERE id=$id;"
       echo "$(date -u -r "$ts" +%FT%TZ) ротация: первый запрос $(date -u -r "$fts" +%TZ) -> $fstatus model=$fmodel retryMs=$fretry"
     elif [[ -n "$next" ]]; then
       sqlite3 "$DB" "UPDATE rotations SET first_status=0 WHERE id=$id;"
@@ -190,7 +191,7 @@ record_first_results() {
 }
 
 burnt_until_ts() {
-  sqlite3 "$DB" "SELECT COALESCE(MAX(ts + CASE WHEN first_retry_ms IS NOT NULL AND first_retry_ms > 0 AND first_retry_ms/1000 < $BURNT_PAUSE_SECS THEN first_retry_ms/1000 ELSE $BURNT_PAUSE_SECS END), 0) FROM rotations WHERE first_status=429 AND reason NOT LIKE '%failed' AND ts > $(( $(date +%s) - BURNT_PAUSE_SECS ));" 2>/dev/null || echo 0
+  sqlite3 "$DB" "SELECT COALESCE((SELECT ts + CASE WHEN first_retry_ms IS NOT NULL AND first_retry_ms > 0 AND first_retry_ms/1000 < $BURNT_PAUSE_SECS THEN first_retry_ms/1000 ELSE $BURNT_PAUSE_SECS END FROM rotations WHERE id = (SELECT MAX(id) FROM rotations WHERE first_status IS NOT NULL AND reason NOT LIKE '%failed') AND first_status=429 AND ts > $(( $(date +%s) - BURNT_PAUSE_SECS ))), 0);" 2>/dev/null || echo 0
 }
 
 first_status_label() {
@@ -202,7 +203,12 @@ first_status_label() {
   esac
 }
 
-cur_ip_warp() { curl -s --socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}" --max-time 8 "https://${ZEN_HOST}/cdn-cgi/trace" 2>/dev/null | awk -F= '/^ip=/ {print $2}' || echo ""; }
+cur_ip_warp() {
+  local ip
+  ip=$(curl -s --socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}" --max-time 8 "https://${ZEN_HOST}/cdn-cgi/trace" 2>/dev/null | awk -F= '/^ip=/ {print $2}')
+  [[ -z "$ip" ]] && ip=$(curl -s --socks5-hostname "127.0.0.1:${WARP_PROXY_PORT}" --max-time 8 "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null | awk -F= '/^ip=/ {print $2}')
+  echo "$ip"
+}
 
 warp_reregister() {
   warp-cli disconnect >/dev/null 2>&1 || true
