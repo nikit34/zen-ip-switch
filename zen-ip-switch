@@ -42,6 +42,12 @@ SQL
   if [[ -z "$(sqlite3 "$DB" "SELECT 1 FROM pragma_table_info('rotations') WHERE name='first_status';")" ]]; then
     sqlite3 "$DB" "ALTER TABLE rotations ADD COLUMN first_ts INTEGER; ALTER TABLE rotations ADD COLUMN first_status INTEGER;"
   fi
+  if [[ -z "$(sqlite3 "$DB" "SELECT 1 FROM pragma_table_info('rotations') WHERE name='first_retry_ms';")" ]]; then
+    sqlite3 "$DB" "ALTER TABLE rotations ADD COLUMN first_retry_ms INTEGER;"
+  fi
+  if [[ -z "$(sqlite3 "$DB" "SELECT 1 FROM pragma_table_info('rotations') WHERE name='first_model';")" ]]; then
+    sqlite3 "$DB" "ALTER TABLE rotations ADD COLUMN first_model TEXT;"
+  fi
 }
 
 log_rotation() { sqlite3 "$DB" "INSERT INTO rotations(ts,reason) VALUES ($(date +%s),'${1//\'/\'\'}');"; }
@@ -161,7 +167,7 @@ rotations_today() {
 
 first_request_after() {
   local from="$1" to="$2"
-  sqlite3 "$OC_DB" "SELECT time_created/1000, COALESCE(json_extract(data,'$.error.status'),200) FROM session_message WHERE type='assistant' AND json_extract(data,'$.model.providerID')='opencode' AND time_created >= $((from * 1000)) AND time_created < $((to * 1000)) AND json_extract(data,'$.time.completed') IS NOT NULL AND (json_extract(data,'$.finish') IS NOT 'error' OR json_extract(data,'$.error.status') IS NOT NULL) ORDER BY time_created LIMIT 1;" 2>/dev/null
+  sqlite3 "$OC_DB" "SELECT time_created/1000, COALESCE(json_extract(data,'$.error.status'),200), COALESCE(json_extract(data,'$.error.retryAfterMs'),0), COALESCE(json_extract(data,'$.model.id'),'') FROM session_message WHERE type='assistant' AND json_extract(data,'$.model.providerID')='opencode' AND time_created >= $((from * 1000)) AND time_created < $((to * 1000)) AND json_extract(data,'$.time.completed') IS NOT NULL AND (json_extract(data,'$.finish') IS NOT 'error' OR json_extract(data,'$.error.status') IS NOT NULL) ORDER BY time_created LIMIT 1;" 2>/dev/null
 }
 
 record_first_results() {
@@ -170,8 +176,13 @@ record_first_results() {
   while IFS='|' read -r id ts next; do
     row=$(first_request_after "$ts" "${next:-$(date +%s)}") || continue
     if [[ -n "$row" ]]; then
-      sqlite3 "$DB" "UPDATE rotations SET first_ts=${row%%|*}, first_status=${row##*|} WHERE id=$id;"
-      echo "$(date -u -r "$ts" +%FT%TZ) ротация: первый запрос $(date -u -r "${row%%|*}" +%TZ) -> ${row##*|}"
+      local fts fstatus fretry fmodel
+      fts="${row%%|*}"; row="${row#*|}"
+      fstatus="${row%%|*}"; row="${row#*|}"
+      fretry="${row%%|*}"; row="${row#*|}"
+      fmodel="$row"
+      sqlite3 "$DB" "UPDATE rotations SET first_ts=$fts, first_status=$fstatus, first_retry_ms=$fretry, first_model='$fmodel' WHERE id=$id;"
+      echo "$(date -u -r "$ts" +%FT%TZ) ротация: первый запрос $(date -u -r "$fts" +%TZ) -> $fstatus model=$fmodel retryMs=$fretry"
     elif [[ -n "$next" ]]; then
       sqlite3 "$DB" "UPDATE rotations SET first_status=0 WHERE id=$id;"
     fi
@@ -179,7 +190,7 @@ record_first_results() {
 }
 
 burnt_until_ts() {
-  sqlite3 "$DB" "SELECT COALESCE(MAX(ts) + $BURNT_PAUSE_SECS, 0) FROM rotations WHERE first_status=429 AND reason NOT LIKE '%failed' AND ts > $(( $(date +%s) - BURNT_PAUSE_SECS ));" 2>/dev/null || echo 0
+  sqlite3 "$DB" "SELECT COALESCE(MAX(ts + CASE WHEN first_retry_ms IS NOT NULL AND first_retry_ms > 0 AND first_retry_ms/1000 < $BURNT_PAUSE_SECS THEN first_retry_ms/1000 ELSE $BURNT_PAUSE_SECS END), 0) FROM rotations WHERE first_status=429 AND reason NOT LIKE '%failed' AND ts > $(( $(date +%s) - BURNT_PAUSE_SECS ));" 2>/dev/null || echo 0
 }
 
 first_status_label() {
