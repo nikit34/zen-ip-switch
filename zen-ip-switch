@@ -161,7 +161,7 @@ last_rotation_ts() {
 }
 
 rotations_today() {
-  local day_start; day_start=$(date -v0H -v0M -v0S +%s)
+  local day_start; day_start=$(date -u -v0H -v0M -v0S +%s)
   sqlite3 "$DB" "SELECT COUNT(*) FROM rotations WHERE ts >= $day_start AND reason NOT LIKE '%failed';" 2>/dev/null || echo 0
 }
 
@@ -214,7 +214,7 @@ warp_reregister() {
   warp-cli disconnect >/dev/null 2>&1 || true
   warp-cli registration delete >/dev/null 2>&1 || true
   sleep 1
-  warp-cli --accept-tos registration new >/dev/null 2>&1 || return 1
+  perl -e 'alarm(30); exec @ARGV' warp-cli --accept-tos registration new >/dev/null 2>&1 || return 1
   warp-cli mode proxy >/dev/null 2>&1 || true
   warp-cli proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
   return 0
@@ -288,6 +288,14 @@ do_daemon_loop() {
     ts=$(date -u +%FT%TZ)
     record_first_results
     a429=$(app_last_429_ts); lrot=$(last_rotation_ts); now=$(date +%s)
+    # самоподнимаем WARP (VPN/Cisco может его сбросить)
+    if ! warp_connected; then
+      echo "$ts WARP отвалился, подключаю"
+      warp-cli connect >/dev/null 2>&1 || true
+      local wi
+      for wi in $(seq 1 20); do warp_connected && break; sleep 1; done
+      if warp_connected; then echo "$ts WARP поднят"; else echo "$ts WARP не поднялся"; fi
+    fi
     # самоподнимаем privoxy
     if ! privoxy_running; then
       if start_privoxy >/dev/null 2>&1; then
