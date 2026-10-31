@@ -74,7 +74,16 @@ process.on('SIGINT', shutdown);
 const server = http.createServer();
 
 server.on('connect', async (req, clientSocket, head) => {
-  const [host, portStr] = req.url.split(':');
+  let host, portStr;
+  if (req.url.startsWith('[')) {
+    const m = req.url.match(/^\[([^\]]+)\]:(\d+)$/);
+    host = m ? m[1] : req.url;
+    portStr = m ? m[2] : '';
+  } else {
+    const idx = req.url.lastIndexOf(':');
+    host = idx >= 0 ? req.url.slice(0, idx) : req.url;
+    portStr = idx >= 0 ? req.url.slice(idx + 1) : '';
+  }
   const port = parseInt(portStr, 10);
   const bind = TARGETS.some(t => host === t || host.endsWith('.' + t));
   let opts = { host, port };

@@ -18,7 +18,7 @@ PRIVOXY_LOG="$STATE_DIR/privoxy.log"
 ZEN_PROXY_URL="http://127.0.0.1:${PRIVOXY_PORT}"
 ZEN_HOST="opencode.ai"
 
-POLL_SECS="${ZEN_POLL_SECS:-60}"
+POLL_SECS="${ZEN_POLL_SECS:-120}"
 MIN_INTERVAL_SECS="${ZEN_MIN_INTERVAL_SECS:-600}"
 MAX_PER_DAY="${ZEN_MAX_PER_DAY:-8}"
 BURNT_PAUSE_SECS="${ZEN_BURNT_PAUSE_SECS:-14400}"
@@ -382,7 +382,7 @@ do_off() {
   stop_privoxy
   step "отключаю WARP"
   warp-cli disconnect >/dev/null 2>&1 || true
-  if app_running; then
+  if app_running && sidecar_proxied_to_zen; then
     step "рестарт OpenCode (прямой выход)"
     app_quit_wait && app_launch_direct && ok "OpenCode без прокси"
   fi

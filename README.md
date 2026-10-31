@@ -35,9 +35,6 @@ zen-ip-switch status           прямой IP, WARP, privoxy, env сайдка�
 zen-ip-switch on               WARP proxy-mode + SOCKS + privoxy + перезапуск OpenCode.app с ALL_PROXY
 zen-ip-switch off              выключить WARP + остановить privoxy + перезапустить OpenCode.app без env
 zen-ip-switch rotate [reason]  переподключить WARP (новый exit), OpenCode не трогается
-zen-ip-switch daemon           фоновый polling: при 429/403 автоматически ротирует, следит за privoxy
-zen-ip-switch stop             остановить фоновый polling
-zen-ip-switch stats            последние ротации и probe из SQLite
 ```
 
 ## Устройство
@@ -67,20 +64,12 @@ zen-ip-switch stats            последние ротации и probe из S
 
 - Если `warp_connected`, но `privoxy_running` = false - **сам поднимает privoxy** (чтобы падение моста не ломало UI).
 - 429 на WARP exit - автоматически `rotate auto`.
-- 403 на WARP exit - `rotate auto403` (вдруг следующий exit в другой стране обойдёт `countryNotAllowed`).
 - 5xx от upstream - пропускает (ротация не поможет).
-- `ZEN_AUTO_OFF_IDLE_MINS` > 0 и OpenCode закрыт столько минут - автоматический `off` и выход.
 - `trap EXIT INT TERM` чистит pid-файл при любом завершении.
 - Внутри loop `set +e`: падение любого curl/sqlite не убивает демон.
 
-### stop
-Рекурсивный `kill_tree` по дереву pid'а - убивает демон вместе с любым запущенным им `rotate`.
-
 ### status
 Шесть секций: прямой IP, WARP (connect статус + exit через SOCKS и через HTTP отдельно), privoxy (pid), OpenCode.app (env сайдкара построчно), последние 5 уникальных CONNECT через privoxy (из `privoxy.log`), демон, пробный Zen.
-
-### stats
-Три SELECT из `metrics.db`: последние 10 ротаций, распределение HTTP-кодов probe за сутки, последние 10 probe.
 
 ## Переменные окружения
 
